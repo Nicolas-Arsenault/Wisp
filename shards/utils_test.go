@@ -91,23 +91,23 @@ func TestAppendToFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.bin")
 	const want = "Hey, its me Nick!"
 
-	if err := appendToFile(path, want); err != nil {
-		t.Fatalf("appendToFile: %v", err)
+	if err := AppendToFile(path, want); err != nil {
+		t.Fatalf("AppendToFile: %v", err)
 	}
-	data, err := readFromFile(path)
+	data, err := ReadFromFile(path)
 	if err != nil {
-		t.Fatalf("readFromFile: %v", err)
+		t.Fatalf("ReadFromFile: %v", err)
 	}
 	if string(data) != want {
-		t.Errorf("readFromFile = %q, want %q", data, want)
+		t.Errorf("ReadFromFile = %q, want %q", data, want)
 	}
 }
 
 func TestAppendToFileWritesNoNewlines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.bin")
 	for range 3 {
-		if err := appendToFile(path, "record"); err != nil {
-			t.Fatalf("appendToFile: %v", err)
+		if err := AppendToFile(path, "record"); err != nil {
+			t.Fatalf("AppendToFile: %v", err)
 		}
 	}
 	raw, err := os.ReadFile(path)
@@ -124,25 +124,25 @@ func TestAppendToFileWritesNoNewlines(t *testing.T) {
 func TestReadFromFileWithMultipleRecordsFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.bin")
 	for range 2 {
-		if err := appendToFile(path, "record"); err != nil {
-			t.Fatalf("appendToFile: %v", err)
+		if err := AppendToFile(path, "record"); err != nil {
+			t.Fatalf("AppendToFile: %v", err)
 		}
 	}
-	if _, err := readFromFile(path); !errors.Is(err, ErrCorruptRecord) {
+	if _, err := ReadFromFile(path); !errors.Is(err, ErrCorruptRecord) {
 		t.Fatalf("got err %v, want ErrCorruptRecord", err)
 	}
 }
 
 func TestAppendToFileMissingDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "does-not-exist", "test.bin")
-	if err := appendToFile(path, "x"); !errors.Is(err, fs.ErrNotExist) {
+	if err := AppendToFile(path, "x"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("got err %v, want fs.ErrNotExist", err)
 	}
 }
 
 func TestReadFromFileMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.bin")
-	if _, err := readFromFile(path); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := ReadFromFile(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("got err %v, want fs.ErrNotExist", err)
 	}
 }
