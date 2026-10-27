@@ -25,7 +25,7 @@ var (
 // seqNumField is the JSON key DecoratePayload writes the sequence number to.
 const seqNumField = "seq_n"
 
-// filePerm is the permission used when appendToFile creates a new file.
+// filePerm is the permission used when AppendToFile creates a new file.
 const filePerm = 0o644
 
 // seqNum is the next sequence number handed out by DecoratePayload.
@@ -145,11 +145,11 @@ func DecompressToRawJSON(compressedBytes []byte) ([]byte, error) {
 	return data, nil
 }
 
-// readFromFile reads filename and decodes it as a single record.
+// ReadFromFile reads filename and decodes it as a single record.
 // Returns an error wrapping fs.ErrNotExist if the file is missing, or
 // ErrCorruptRecord if its content is not exactly one encoded record
-// (e.g. after appendToFile was called more than once — see TODO there).
-func readFromFile(filename string) ([]byte, error) {
+// (e.g. after AppendToFile was called more than once — see TODO there).
+func ReadFromFile(filename string) ([]byte, error) {
 	fileBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("records: read %q: %w", filename, err)
@@ -162,7 +162,7 @@ func readFromFile(filename string) ([]byte, error) {
 	return data, nil
 }
 
-// appendToFile compresses content and appends it to filename, creating the
+// AppendToFile compresses content and appends it to filename, creating the
 // file if needed. The parent directory must exist.
 //
 // The error from closing the file is returned too, because for writes a
@@ -171,7 +171,7 @@ func readFromFile(filename string) ([]byte, error) {
 // TODO: records are appended with no separator or length prefix, so a file
 // holding more than one record cannot be read back. Add framing and check
 // for contiguous memory.
-func appendToFile(filename string, content string) (err error) {
+func AppendToFile(filename string, content string) (err error) {
 	// Compress first so a failure never leaves the file opened/created for nothing.
 	compressed, err := CompressRawJSON([]byte(content))
 	if err != nil {
