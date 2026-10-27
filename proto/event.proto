@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package wisp;
+option go_package = "wisp/proto";
+
+service EventBroker {
+  rpc PublishEvent (EventRequest) returns (PublishResponse);
+}
+
+message EventRequest {
+  string topic = 1;
+  bytes payload = 2;
+}
+
+message PublishResponse {
+  bool success = 1;
+}
