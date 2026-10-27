@@ -1,0 +1,10 @@
+# Ignore compiled binaries
+wisp
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Ignore test coverage reports
+*.out
