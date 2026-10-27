@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"os"
 )
+
+var seqNum = 0
 
 func CompressRawJSON(jsonBytes []byte) (string, error) {
 	var b bytes.Buffer
@@ -32,6 +35,23 @@ func CompressRawJSON(jsonBytes []byte) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+func DecoratePayload(payload string) (string, error) {
+
+	//TODO: review flow to limit serialization to a minimum
+	var data map[string]interface{}
+	err := json.Unmarshal([]byte(payload), &data)
+	if err != nil {
+		return "", err
+	}
+	data["seq_n"] = seqNum
+	seqNum += 1
+	updatedBytes, err := json.Marshal(data)
+	if err != nil {
+		return "", err
+	}
+	return string(updatedBytes), nil
 }
 
 func DecompressToRawJSON(compressedBytes []byte) ([]byte, error) {
@@ -61,6 +81,7 @@ func readFromFile(filename string) (error, []byte) {
 	return nil, data
 }
 
+// TODO: add separator, and check for contiguous memory
 func appendToFile(filename string, content string) error {
 	jsonBytes := []byte(content)
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)

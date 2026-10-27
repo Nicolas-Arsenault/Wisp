@@ -2,6 +2,7 @@
 package records
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -16,4 +17,21 @@ func TestAppendToFile(t *testing.T) {
 		t.Error("Error when reading from file, input data altered.")
 	}
 	fmt.Println(string(data))
+}
+
+func TestDecoratePayload(t *testing.T) {
+	s, err := DecoratePayload("{\"test\": 123}")
+	if err != nil {
+		t.Error("Error while decorating the payload." + err.Error())
+	}
+	var data map[string]interface{}
+	json.Unmarshal([]byte(s), &data)
+	if data["seq_n"] == nil {
+		t.Error("Sequence number field not present on decorated data.")
+	}
+	DecoratePayload("{\"test\": 321}")
+	if seqNum != 2 {
+		t.Error("Sequence number didnt increment correctly")
+	}
+
 }
