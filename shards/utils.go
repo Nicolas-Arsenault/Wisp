@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 )
 
@@ -39,9 +40,29 @@ const seqNumField = "seq_n"
 // filePerm is the permission used when AppendToFile creates a new file.
 const filePerm = 0o644
 
-// seqNum is the next sequence number handed out by DecoratePayload.
-// NOTE: not safe for concurrent use.
-var seqNum = 0
+// ShardSequences holds the next sequence number of each shard, keyed by
+// generateShardKey. Safe for concurrent use.
+type ShardSequences struct {
+	mu   sync.Mutex //for the map itself
+	next map[string]int
+}
+
+// GlobalShardSequences is the sequence map DecoratePayload hands numbers out from.
+var GlobalShardSequences = &ShardSequences{
+	next: make(map[string]int),
+}
+
+// Next atomically returns the next sequence number for key and advances it.
+// A key seen for the first time starts at 0. Concurrent callers on the same
+// key always get distinct, consecutive numbers.
+func (s *ShardSequences) Next(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n := s.next[key] // missing key: zero value, so it starts at 0
+	s.next[key] = n + 1
+	return n
+}
 
 // logger is the package logger. nil means "use slog.Default() at call time",
 // so the package follows whatever the application configured with slog.SetDefault.
@@ -91,34 +112,42 @@ func CompressRawJSON(jsonBytes []byte) (string, error) {
 }
 
 // DecoratePayload parses payload as a JSON object, adds the next sequence
-// number under "seq_n", and returns the re-serialized object.
+// number of the shard (topic, shard) under "seq_n", and returns the
+// re-serialized object and that sequence number. Each shard has its own
+// sequence, starting at 0.
+//
+// Safe for concurrent use. To keep records in sequence order inside a shard
+// file, call it while holding that file's lock (AppendToFile does).
 //
 // Edge cases:
 //   - payload must be a JSON object; arrays, scalars and `null` return ErrInvalidPayload.
 //   - an existing "seq_n" field is overwritten (a warning is logged).
-//   - seqNum is only incremented on success.
-func DecoratePayload(payload string) (string, error) {
+//   - an invalid payload does not use up a sequence number.
+func DecoratePayload(payload string, topic string, shard int) (string, int, error) {
 
 	//TODO: review flow to limit serialization to a minimum
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(payload), &data); err != nil {
-		return "", fmt.Errorf("%w: %w", ErrInvalidPayload, err)
+		return "", 0, fmt.Errorf("%w: %w", ErrInvalidPayload, err)
 	}
 	// `null` unmarshals without error into a nil map; writing to it would panic.
 	if data == nil {
-		return "", fmt.Errorf("%w: got null", ErrInvalidPayload)
+		return "", 0, fmt.Errorf("%w: got null", ErrInvalidPayload)
 	}
 	if _, exists := data[seqNumField]; exists {
 		log().Warn("payload already contains sequence field, overwriting", "field", seqNumField)
 	}
-	data[seqNumField] = seqNum
+	// Take the number only once the payload is known to be valid.
+	key := generateShardKey(topic, shard)
+	seq := GlobalShardSequences.Next(key)
+	data[seqNumField] = seq
 	updatedBytes, err := json.Marshal(data)
 	if err != nil {
-		return "", fmt.Errorf("records: marshal decorated payload: %w", err)
+		// Can't happen for data decoded from JSON; if it did, seq is skipped.
+		return "", 0, fmt.Errorf("records: marshal decorated payload: %w", err)
 	}
-	log().Debug("decorated payload", "seq_n", seqNum)
-	seqNum += 1
-	return string(updatedBytes), nil
+	log().Debug("decorated payload", "shard", key, "seq_n", seq)
+	return string(updatedBytes), seq, nil
 }
 
 // DecompressToRawJSON reverses CompressRawJSON: base64-decodes then
@@ -181,6 +210,14 @@ func (l *FileLock) Getlock(filePath string) (*sync.Mutex, error) {
 	return lock, nil
 }
 
+// generateShardKey returns the key of a shard in GlobalShardSequences:
+// "<topic>/<shard>", e.g. "orders/3". The separator keeps keys unique
+// ("a1"+1 and "a"+11 would otherwise both be "a11"); the shard is always the
+// last segment, so a "/" inside the topic can't cause a clash either.
+func generateShardKey(topic string, shard int) string {
+	return topic + "/" + strconv.Itoa(shard)
+}
+
 // ReadFromFile reads filename and decodes it as a single record.
 // Returns an error wrapping fs.ErrNotExist if the file is missing, or
 // ErrCorruptRecord if its content is not exactly one encoded record
@@ -206,8 +243,21 @@ func ReadFromFile(filename string) ([]byte, error) {
 	return data, nil
 }
 
-// AppendToFile compresses content and appends it to filename, creating the
-// file if needed. The parent directory must exist.
+// StoredRecord describes a record written by AppendToFile.
+type StoredRecord struct {
+	Seq     int    // the record's seq_n within its shard
+	Payload string // the record as stored, before compression (JSON with seq_n)
+}
+
+// AppendToFile decorates content with the next sequence number of shard
+// (topic, shard), compresses it and appends it to filename, creating the file
+// if needed. The parent directory must exist. content must be a JSON object
+// (see DecoratePayload). On success it returns the stored record.
+//
+// The sequence number is taken while holding the file lock, so records are
+// written to the file in sequence order even with concurrent callers.
+// If opening or writing the file fails after that, the number is skipped
+// (a gap in the shard's sequence).
 //
 // The error from closing the file is returned too, because for writes a
 // failed Close can mean the data never reached disk.
@@ -215,33 +265,40 @@ func ReadFromFile(filename string) ([]byte, error) {
 // TODO: records are appended with no separator or length prefix, so a file
 // holding more than one record cannot be read back. Add framing and check
 // for contiguous memory.
-func AppendToFile(filename string, content string) (err error) {
-	// Compress first so a failure never leaves the file opened/created for nothing.
-
+// TODO: LIMIT JSON SERIALIZATION.....
+func AppendToFile(filename string, topic string, shard int, content string) (record StoredRecord, err error) {
 	fileLock, err := GlobalFileLock.Getlock(filename)
 	if err != nil {
-		return err
+		return StoredRecord{}, err
 	}
 	fileLock.Lock()
 	defer fileLock.Unlock()
-	compressed, err := CompressRawJSON([]byte(content))
+
+	// Decorate and compress before opening, so a bad payload never leaves the
+	// file opened/created for nothing.
+	newContent, seq, err := DecoratePayload(content, topic, shard)
 	if err != nil {
-		return err
+		return StoredRecord{}, err
+	}
+	compressed, err := CompressRawJSON([]byte(newContent))
+	if err != nil {
+		return StoredRecord{}, err
 	}
 
 	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, filePerm)
 	if err != nil {
-		return fmt.Errorf("records: open %q for append: %w", filename, err)
+		return StoredRecord{}, fmt.Errorf("records: open %q for append: %w", filename, err)
 	}
 	defer func() {
 		if closeErr := file.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("records: close %q: %w", filename, closeErr)
+			record = StoredRecord{}
 		}
 	}()
 
 	if _, err = file.WriteString(compressed); err != nil {
-		return fmt.Errorf("records: write %q: %w", filename, err)
+		return StoredRecord{}, fmt.Errorf("records: write %q: %w", filename, err)
 	}
-	log().Debug("appended record to file", "file", filename, "bytes", len(compressed))
-	return nil
+	log().Debug("appended record to file", "file", filename, "seq_n", seq, "bytes", len(compressed))
+	return StoredRecord{Seq: seq, Payload: newContent}, nil
 }

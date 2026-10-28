@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,12 +22,13 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// resetSeqNum makes sequence-number tests independent of test order.
-func resetSeqNum(t *testing.T) {
+// resetSequences gives the test an empty GlobalShardSequences, so
+// sequence-number tests don't depend on test order or -count reruns.
+func resetSequences(t *testing.T) {
 	t.Helper()
-	old := seqNum
-	seqNum = 0
-	t.Cleanup(func() { seqNum = old })
+	old := GlobalShardSequences
+	GlobalShardSequences = &ShardSequences{next: make(map[string]int)}
+	t.Cleanup(func() { GlobalShardSequences = old })
 }
 
 func TestCompressDecompressRoundTrip(t *testing.T) {
@@ -89,11 +91,17 @@ func TestDecompressToRawJSONErrors(t *testing.T) {
 }
 
 func TestAppendToFile(t *testing.T) {
+	resetSequences(t)
 	path := filepath.Join(t.TempDir(), "test.bin")
-	const want = "Hey, its me Nick!"
+	// The stored record is the decorated payload; json.Marshal sorts keys.
+	const want = `{"msg":"Hey, its me Nick!","seq_n":0}`
 
-	if err := AppendToFile(path, want); err != nil {
+	record, err := AppendToFile(path, "t", 0, `{"msg":"Hey, its me Nick!"}`)
+	if err != nil {
 		t.Fatalf("AppendToFile: %v", err)
+	}
+	if record.Seq != 0 || record.Payload != want {
+		t.Errorf("AppendToFile returned %+v, want Seq 0, Payload %q", record, want)
 	}
 	data, err := ReadFromFile(path)
 	if err != nil {
@@ -107,7 +115,7 @@ func TestAppendToFile(t *testing.T) {
 func TestAppendToFileWritesNoNewlines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.bin")
 	for range 3 {
-		if err := AppendToFile(path, "record"); err != nil {
+		if _, err := AppendToFile(path, "t", 0, `{"r":1}`); err != nil {
 			t.Fatalf("AppendToFile: %v", err)
 		}
 	}
@@ -125,7 +133,7 @@ func TestAppendToFileWritesNoNewlines(t *testing.T) {
 func TestReadFromFileWithMultipleRecordsFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.bin")
 	for range 2 {
-		if err := AppendToFile(path, "record"); err != nil {
+		if _, err := AppendToFile(path, "t", 0, `{"r":1}`); err != nil {
 			t.Fatalf("AppendToFile: %v", err)
 		}
 	}
@@ -136,7 +144,7 @@ func TestReadFromFileWithMultipleRecordsFails(t *testing.T) {
 
 func TestAppendToFileMissingDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "does-not-exist", "test.bin")
-	if err := AppendToFile(path, "x"); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := AppendToFile(path, "t", 0, `{"x":1}`); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("got err %v, want fs.ErrNotExist", err)
 	}
 }
@@ -149,9 +157,9 @@ func TestReadFromFileMissing(t *testing.T) {
 }
 
 func TestDecoratePayload(t *testing.T) {
-	resetSeqNum(t)
+	resetSequences(t)
 
-	s, err := DecoratePayload(`{"test": 123}`)
+	s, _, err := DecoratePayload(`{"test": 123}`, "t", 0)
 	if err != nil {
 		t.Fatalf("DecoratePayload: %v", err)
 	}
@@ -167,19 +175,23 @@ func TestDecoratePayload(t *testing.T) {
 		t.Errorf("original field altered: test = %v, want 123", data["test"])
 	}
 
-	if _, err := DecoratePayload(`{"test": 321}`); err != nil {
-		t.Fatalf("DecoratePayload: %v", err)
+	if s, _, _ := DecoratePayload(`{"test": 321}`, "t", 0); s != `{"seq_n":1,"test":321}` {
+		t.Errorf("second record on t/0 = %s, want seq_n 1", s)
 	}
-	if seqNum != 2 {
-		t.Errorf("seqNum = %d, want 2", seqNum)
+	// Every shard has its own sequence.
+	if s, _, _ := DecoratePayload(`{"test": 1}`, "t", 1); s != `{"seq_n":0,"test":1}` {
+		t.Errorf("first record on t/1 = %s, want seq_n 0", s)
+	}
+	if s, _, _ := DecoratePayload(`{"test": 1}`, "other", 0); s != `{"seq_n":0,"test":1}` {
+		t.Errorf("first record on other/0 = %s, want seq_n 0", s)
 	}
 }
 
 func TestDecoratePayloadOverwritesExistingSeqN(t *testing.T) {
-	resetSeqNum(t)
-	seqNum = 7
+	resetSequences(t)
+	GlobalShardSequences.next[generateShardKey("t", 0)] = 7
 
-	s, err := DecoratePayload(`{"seq_n": 999}`)
+	s, _, err := DecoratePayload(`{"seq_n": 999}`, "t", 0)
 	if err != nil {
 		t.Fatalf("DecoratePayload: %v", err)
 	}
@@ -202,16 +214,16 @@ func TestDecoratePayloadInvalid(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resetSeqNum(t)
-			got, err := DecoratePayload(tc.payload)
+			resetSequences(t)
+			got, _, err := DecoratePayload(tc.payload, "t", 0)
 			if !errors.Is(err, ErrInvalidPayload) {
 				t.Fatalf("got err %v, want ErrInvalidPayload", err)
 			}
 			if got != "" {
 				t.Errorf("got %q on error, want empty string", got)
 			}
-			if seqNum != 0 {
-				t.Errorf("seqNum advanced to %d on failure, want 0", seqNum)
+			if n := GlobalShardSequences.next[generateShardKey("t", 0)]; n != 0 {
+				t.Errorf("sequence advanced to %d on failure, want 0", n)
 			}
 		})
 	}
@@ -253,5 +265,89 @@ func TestGetlockSamePathSharesMutex(t *testing.T) {
 	}
 	if len(l.locks) != 2 {
 		t.Errorf("len(locks) = %d, want 2", len(l.locks))
+	}
+}
+
+func TestGenerateShardKey(t *testing.T) {
+	if got := generateShardKey("orders", 3); got != "orders/3" {
+		t.Errorf("generateShardKey(orders, 3) = %q, want orders/3", got)
+	}
+	if generateShardKey("a1", 1) == generateShardKey("a", 11) {
+		t.Error("keys for (a1, 1) and (a, 11) must differ")
+	}
+}
+
+// Run with -race. Many goroutines on one shard must get every number in
+// 0..total-1 exactly once.
+func TestShardSequencesConcurrentNext(t *testing.T) {
+	const goroutines, perGoroutine = 50, 100
+	const total = goroutines * perGoroutine
+	s := &ShardSequences{next: make(map[string]int)}
+
+	var mu sync.Mutex
+	seen := make(map[int]bool, total)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				n := s.Next("t/0")
+				s.Next("t/1") // another shard at the same time
+				mu.Lock()
+				if seen[n] {
+					t.Errorf("sequence %d handed out twice", n)
+				}
+				seen[n] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	for n := 0; n < total; n++ {
+		if !seen[n] {
+			t.Fatalf("sequence %d was never handed out", n)
+		}
+	}
+	if got := s.Next("t/1"); got != total {
+		t.Errorf("t/1 next = %d, want %d", got, total)
+	}
+}
+
+// Concurrent appends to one shard must write records in sequence order.
+// Files can't be read back record by record yet (no framing), so the test
+// compares the raw file with records seq_n 0..n-1 compressed and concatenated.
+func TestAppendToFileConcurrentInOrder(t *testing.T) {
+	resetSequences(t)
+	path := filepath.Join(t.TempDir(), "0")
+	const writers = 50
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := AppendToFile(path, "t", 0, `{"r":1}`); err != nil {
+				t.Errorf("AppendToFile: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var want strings.Builder
+	for n := 0; n < writers; n++ {
+		c, err := CompressRawJSON([]byte(`{"r":1,"seq_n":` + strconv.Itoa(n) + `}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want.WriteString(c)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want.String() {
+		t.Error("file content is not records seq_n 0..49 in order")
 	}
 }

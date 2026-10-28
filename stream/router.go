@@ -6,6 +6,7 @@ package stream
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"wisp/shards"
 )
@@ -67,15 +68,32 @@ var NUMBER_SHARDS = 5
 // all calls, so it lives at package level. TODO: check eviction policies later.
 var cache = NewSafeCache[string, int]()
 
+// WriteResult describes where WriteToStream stored an event.
+type WriteResult struct {
+	Topic   string
+	Shard   int    // shard the event went to, 0..NUMBER_SHARDS-1
+	Seq     int    // the event's seq_n within that shard
+	Payload []byte // the event as stored (JSON with seq_n added)
+}
+
+// EventID returns the event's unique id, "<topic>/<shard>/<seq_n>",
+// e.g. "orders/3/41". It is unique per process run: seq_n restarts at 0 when
+// the process restarts (see docs/shards.md).
+func (w WriteResult) EventID() string {
+	return w.Topic + "/" + strconv.Itoa(w.Shard) + "/" + strconv.Itoa(w.Seq)
+}
+
 // WriteToStream appends data to the next shard of topic, picking shards
 // round robin (0, 1, ..., NUMBER_SHARDS-1, 0, ...). The topic directory is
 // created if it does not exist.
 //
-// Returns an error if the topic directory cannot be created or the append
-// fails. The round-robin position advances even on failure.
+// On success it returns where the event was stored. Returns an error if the
+// topic directory cannot be created or the append fails (an error wrapping
+// shards.ErrInvalidPayload if data is not a JSON object). The round-robin
+// position advances even on failure.
 //
 // Safe for concurrent use: each call gets its own shard turn atomically.
-func WriteToStream(data []byte, topic string) error {
+func WriteToStream(data []byte, topic string) (WriteResult, error) {
 	// A missing topic has turn 0 (the zero value), so it starts at shard 0.
 	turn, _ := cache.Update(topic, func(old int, _ bool) int {
 		return (old + 1) % NUMBER_SHARDS //simple round robin for now
@@ -84,13 +102,14 @@ func WriteToStream(data []byte, topic string) error {
 	fileName := generateShardFileName(turn, topic)
 	if err := os.MkdirAll(filepath.Dir(fileName), dirPerm); err != nil {
 		log().Error("failed to create topic dir", "topic", topic, "err", err)
-		return err
+		return WriteResult{}, err
 	}
-	//TODO: writer pool later...
-	if err := shards.AppendToFile(fileName, string(data)); err != nil {
+
+	record, err := shards.AppendToFile(fileName, topic, turn, string(data))
+	if err != nil {
 		log().Error("failed to write to stream", "topic", topic, "shard", turn, "err", err)
-		return err
+		return WriteResult{}, err
 	}
-	log().Debug("wrote to stream", "topic", topic, "shard", turn, "bytes", len(data))
-	return nil
+	log().Debug("wrote to stream", "topic", topic, "shard", turn, "seq_n", record.Seq, "bytes", len(data))
+	return WriteResult{Topic: topic, Shard: turn, Seq: record.Seq, Payload: []byte(record.Payload)}, nil
 }

@@ -19,7 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	EventBroker_PublishEvent_FullMethodName = "/wisp.EventBroker/PublishEvent"
+	EventBroker_PublishEvent_FullMethodName   = "/wisp.EventBroker/PublishEvent"
+	EventBroker_SubscribeTopic_FullMethodName = "/wisp.EventBroker/SubscribeTopic"
 )
 
 // EventBrokerClient is the client API for EventBroker service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type EventBrokerClient interface {
 	PublishEvent(ctx context.Context, in *EventRequest, opts ...grpc.CallOption) (*PublishResponse, error)
+	SubscribeTopic(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventResponse], error)
 }
 
 type eventBrokerClient struct {
@@ -47,11 +49,31 @@ func (c *eventBrokerClient) PublishEvent(ctx context.Context, in *EventRequest, 
 	return out, nil
 }
 
+func (c *eventBrokerClient) SubscribeTopic(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &EventBroker_ServiceDesc.Streams[0], EventBroker_SubscribeTopic_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SubscribeRequest, EventResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_SubscribeTopicClient = grpc.ServerStreamingClient[EventResponse]
+
 // EventBrokerServer is the server API for EventBroker service.
 // All implementations must embed UnimplementedEventBrokerServer
 // for forward compatibility.
 type EventBrokerServer interface {
 	PublishEvent(context.Context, *EventRequest) (*PublishResponse, error)
+	SubscribeTopic(*SubscribeRequest, grpc.ServerStreamingServer[EventResponse]) error
 	mustEmbedUnimplementedEventBrokerServer()
 }
 
@@ -64,6 +86,9 @@ type UnimplementedEventBrokerServer struct{}
 
 func (UnimplementedEventBrokerServer) PublishEvent(context.Context, *EventRequest) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishEvent not implemented")
+}
+func (UnimplementedEventBrokerServer) SubscribeTopic(*SubscribeRequest, grpc.ServerStreamingServer[EventResponse]) error {
+	return status.Error(codes.Unimplemented, "method SubscribeTopic not implemented")
 }
 func (UnimplementedEventBrokerServer) mustEmbedUnimplementedEventBrokerServer() {}
 func (UnimplementedEventBrokerServer) testEmbeddedByValue()                     {}
@@ -104,6 +129,17 @@ func _EventBroker_PublishEvent_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EventBroker_SubscribeTopic_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EventBrokerServer).SubscribeTopic(m, &grpc.GenericServerStream[SubscribeRequest, EventResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_SubscribeTopicServer = grpc.ServerStreamingServer[EventResponse]
+
 // EventBroker_ServiceDesc is the grpc.ServiceDesc for EventBroker service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -116,6 +152,12 @@ var EventBroker_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _EventBroker_PublishEvent_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SubscribeTopic",
+			Handler:       _EventBroker_SubscribeTopic_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "proto/event.proto",
 }
