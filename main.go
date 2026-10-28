@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
-	"sync"
-	"time"
+	"os"
+	"os/signal"
+	"syscall"
 	pb "wisp/proto"
 	"wisp/shards"
-
 	"wisp/stream"
 
 	"google.golang.org/grpc"
@@ -17,153 +19,227 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// subscriberBuffer is how many events a consumer can fall behind before
-// PublishEvent starts dropping events for it (see Server.broadcast).
-const subscriberBuffer = 64
+const (
+	listenAddr = ":50051"
+	dataDir    = "../data"
 
-// subscriber is one consumer connected through SubscribeTopic. PublishEvent
-// pushes events onto its channel; only the consumer's own SubscribeTopic call
-// reads it and calls Send, because gRPC does not allow concurrent Sends on
-// one stream.
-type subscriber struct {
-	events chan *pb.EventResponse
-}
+	publishWindow   = 256            // acks a producer can wait for before we stop reading its stream
+	defaultMaxBytes = 1 << 20        // batch size when the consumer sends max_bytes = 0
+	maxMaxBytes     = 4<<20 - 64<<10 // gRPC clients refuse messages over 4 MiB
+)
+
+var errBadShard = errors.New("shard out of range")
 
 type Server struct {
 	pb.UnimplementedEventBrokerServer
-	mu sync.RWMutex
-	// subscribers is the set of consumers of each topic. A set (instead of a
-	// slice) makes removal simple and never mutates memory a reader still holds.
-	subscribers map[string]map[*subscriber]struct{}
+	topics *stream.Registry
 }
 
-func NewBrokerServer() *Server {
-	return &Server{
-		subscribers: make(map[string]map[*subscriber]struct{}),
-	}
+func NewBrokerServer(topics *stream.Registry) *Server {
+	return &Server{topics: topics}
 }
 
-// gRPC function
-// multithreaded from google grpc...
-//
-// PublishEvent writes the event to the topic's stream, then sends the stored
-// event to every current consumer of the topic. Consumers that subscribe
-// later don't get it.
-//
-// Errors: codes.InvalidArgument if the payload is not a JSON object,
-// codes.Internal if it could not be written. Nothing is sent to consumers
-// in either case.
-func (s *Server) PublishEvent(ctx context.Context, req *pb.EventRequest) (*pb.PublishResponse, error) {
-	slog.Debug("received event", "topic", req.Topic, "bytes", len(req.Payload))
-
-	//TODO: Change this later like kafkha style
-	// Consumer group that gets shards assigned... and auto rebalance
-	written, err := stream.WriteToStream(req.Payload, req.Topic)
-	if errors.Is(err, shards.ErrInvalidPayload) {
-		return nil, status.Error(codes.InvalidArgument, err.Error()) // err already says "payload must be a JSON object"
-	}
+// DescribeTopic returns the topic's shard count, creating the topic if needed.
+func (s *Server) DescribeTopic(_ context.Context, req *pb.DescribeTopicRequest) (*pb.TopicInfo, error) {
+	topicShards, err := s.topics.Topic(req.GetTopic())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "could not write event: %v", err)
+		return nil, status.Error(codeFor(err), err.Error())
 	}
-
-	s.broadcast(req.Topic, &pb.EventResponse{
-		EventId:   written.EventID(),
-		Payload:   written.Payload,
-		Timestamp: time.Now().UnixMilli(),
-	})
-	return &pb.PublishResponse{Success: true}, nil
+	return &pb.TopicInfo{Topic: req.GetTopic(), NumShards: int32(len(topicShards))}, nil
 }
 
-// broadcast hands event to every consumer of topic without ever blocking:
-// if a consumer's buffer is full, the event is dropped for that consumer and
-// a warning is logged. The event is still on disk.
-//
-// Events published concurrently on one topic may reach consumers in a
-// different order than their seq_n.
-func (s *Server) broadcast(topic string, event *pb.EventResponse) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for sub := range s.subscribers[topic] {
-		select {
-		case sub.events <- event:
-		default:
-			slog.Warn("consumer too slow, dropped event", "topic", topic, "event_id", event.EventId)
-		}
-	}
+type pendingAck struct {
+	ack     *pb.PublishAck
+	pending *shards.Pending // nil if the request already failed
 }
 
-// SubscribeTopic registers the consumer for req.Topic and streams it every
-// event published on that topic from now on, until the consumer disconnects.
-// It returns the context error on disconnect, or the Send error if sending
-// fails; either way the consumer is removed.
-func (s *Server) SubscribeTopic(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error {
-	topic := req.Topic
-	sub := s.addSubscriber(topic)
-	// Ensure cleanup when the consumer eventually disconnects
-	defer s.removeSubscriber(topic, sub)
+// Publish serves one producer. Each request goes on the queue of the shard
+// it names, in order, and gets one ack once stored. A bad request gets an
+// error ack and the stream stays open.
+func (s *Server) Publish(srv pb.EventBroker_PublishServer) error {
+	acks := make(chan pendingAck, publishWindow)
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- sendAcks(srv, acks) }()
 
-	// Keep the stream alive, sending events, until the client drops the
-	// connection or the context is cancelled.
-	//TODO: Change this so it uses offset and subscribes to a specific shard
-	ctx := stream.Context()
+	recvErr := s.receive(srv, acks)
+	close(acks)
+	sendErr := <-sendDone
+	if recvErr != nil {
+		return recvErr
+	}
+	return sendErr
+}
+
+// receive queues each request until the producer closes its side.
+func (s *Server) receive(srv pb.EventBroker_PublishServer, acks chan<- pendingAck) error {
+	ctx := srv.Context()
 	for {
+		req, err := srv.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		ack := &pb.PublishAck{RequestId: req.GetRequestId(), Shard: req.GetShard()}
+		pending, err := s.enqueue(ctx, req)
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		if err != nil {
+			setAckError(ack, err)
+			slog.Warn("rejected event", "topic", req.GetTopic(), "shard", req.GetShard(), "err", err)
+		}
 		select {
+		case acks <- pendingAck{ack, pending}:
 		case <-ctx.Done():
-			return ctx.Err()
-		case event := <-sub.events:
-			if err := stream.Send(event); err != nil {
-				slog.Warn("could not send event to consumer", "topic", topic, "event_id", event.EventId, "err", err)
-				return err
-			}
+			return status.FromContextError(ctx.Err()).Err()
 		}
 	}
 }
 
-// addSubscriber registers a new consumer of topic, thread-safely.
-func (s *Server) addSubscriber(topic string) *subscriber {
-	sub := &subscriber{events: make(chan *pb.EventResponse, subscriberBuffer)}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.subscribers[topic] == nil {
-		s.subscribers[topic] = make(map[*subscriber]struct{})
+func (s *Server) enqueue(ctx context.Context, req *pb.PublishRequest) (*shards.Pending, error) {
+	topicShards, err := s.topics.Topic(req.GetTopic())
+	if err != nil {
+		return nil, err
 	}
-	s.subscribers[topic][sub] = struct{}{}
-	slog.Info("consumer subscribed", "topic", topic, "consumers", len(s.subscribers[topic]))
-	return sub
+	shard := req.GetShard()
+	if shard < 0 || int(shard) >= len(topicShards) {
+		return nil, fmt.Errorf("%w: %d (topic has %d)", errBadShard, shard, len(topicShards))
+	}
+	return topicShards[shard].Enqueue(ctx, req.GetPayload())
 }
 
-// removeSubscriber unregisters sub. Its channel is left open on purpose:
-// closing it could race with a broadcast still sending to it.
-func (s *Server) removeSubscriber(topic string, sub *subscriber) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.subscribers[topic], sub)
-	if len(s.subscribers[topic]) == 0 {
-		delete(s.subscribers, topic)
+// sendAcks sends acks in request order. After a send error it keeps
+// draining so receive never blocks.
+func sendAcks(srv pb.EventBroker_PublishServer, acks <-chan pendingAck) error {
+	var sendErr error
+	for a := range acks {
+		if a.pending != nil {
+			id, err := a.pending.Wait()
+			if err != nil {
+				setAckError(a.ack, err)
+			}
+			a.ack.EventId = id
+		}
+		if sendErr == nil {
+			sendErr = srv.Send(a.ack)
+		}
 	}
-	slog.Info("consumer cleaned up", "topic", topic)
+	return sendErr
 }
 
-// subscriberCount returns how many consumers topic has.
-func (s *Server) subscriberCount(topic string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.subscribers[topic])
+func setAckError(ack *pb.PublishAck, err error) {
+	ack.ErrorCode = int32(codeFor(err))
+	ack.ErrorMessage = err.Error()
+}
+
+func codeFor(err error) codes.Code {
+	switch {
+	case errors.Is(err, shards.ErrInvalidPayload), errors.Is(err, stream.ErrInvalidTopic), errors.Is(err, errBadShard):
+		return codes.InvalidArgument
+	case errors.Is(err, shards.ErrShardFull):
+		return codes.ResourceExhausted
+	case errors.Is(err, shards.ErrShardClosed):
+		return codes.Unavailable
+	default:
+		return codes.Internal
+	}
+}
+
+// Subscribe sends one shard from start_id (or from the end if latest): all
+// stored records first, then new ones as they are stored. Records are read
+// from disk, so a slow consumer never loses any.
+func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_SubscribeServer) error {
+	topicShards, ok := s.topics.Lookup(req.GetTopic())
+	if !ok {
+		return status.Errorf(codes.NotFound, "topic %q does not exist", req.GetTopic())
+	}
+	if req.GetShard() < 0 || int(req.GetShard()) >= len(topicShards) {
+		return status.Errorf(codes.InvalidArgument, "shard %d out of range (topic has %d)", req.GetShard(), len(topicShards))
+	}
+	shard := topicShards[req.GetShard()]
+	maxBytes := fetchSize(req.GetMaxBytes())
+
+	next := req.GetStartId()
+	if req.GetLatest() {
+		next = shard.NextID()
+	} else if next > shard.NextID() {
+		return status.Errorf(codes.OutOfRange, "start_id %d is after the end of the shard (%d)", next, shard.NextID())
+	}
+
+	slog.Info("consumer subscribed", "topic", req.GetTopic(), "shard", req.GetShard(), "start_id", next)
+	ctx := srv.Context()
+	for {
+		records, err := shard.ReadFrom(next, maxBytes)
+		if err != nil {
+			slog.Error("could not read shard", "topic", req.GetTopic(), "shard", req.GetShard(), "err", err)
+			return status.Errorf(codes.Internal, "could not read event %d: %v", next, err)
+		}
+		if len(records) == 0 {
+			if err := shard.Wait(ctx, next); err != nil {
+				if errors.Is(err, shards.ErrShardClosed) {
+					return status.Error(codes.Unavailable, "broker is shutting down")
+				}
+				return status.FromContextError(err).Err()
+			}
+			continue
+		}
+
+		batch := &pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard()}
+		for _, r := range records {
+			batch.Events = append(batch.Events, &pb.Event{EventId: r.ID, Payload: r.Payload, Timestamp: r.Timestamp})
+		}
+		if err := srv.Send(batch); err != nil {
+			return err
+		}
+		next = records[len(records)-1].ID + 1
+	}
+}
+
+func fetchSize(requested uint32) int {
+	if requested == 0 {
+		return defaultMaxBytes
+	}
+	return min(int(requested), maxMaxBytes)
 }
 
 func main() {
-	lis, err := net.Listen("tcp", ":50051")
+	if err := run(); err != nil {
+		slog.Error("broker stopped", "err", err)
+		os.Exit(1)
+	}
+}
+
+// run serves until Ctrl+C or SIGTERM. Then it disconnects every client,
+// waits for the handlers to return, and closes the shards (which still
+// stores the records already queued).
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	topics, err := stream.OpenRegistry(dataDir)
 	if err != nil {
-		panic(err)
+		return err
+	}
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		topics.Close()
+		return err
 	}
 
-	grpcServer := grpc.NewServer()
-	pb.RegisterEventBrokerServer(grpcServer, NewBrokerServer())
+	// WaitForHandlers: Stop waits until no handler can still read a shard.
+	grpcServer := grpc.NewServer(grpc.WaitForHandlers(true))
+	pb.RegisterEventBrokerServer(grpcServer, NewBrokerServer(topics))
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutting down")
+		grpcServer.Stop()
+	}()
 
-	slog.Info("gRPC Broker listening on port 50051...")
-	if err := grpcServer.Serve(lis); err != nil {
-		panic(err)
-	}
+	slog.Info("broker listening", "addr", listenAddr, "data_dir", dataDir)
+	serveErr := grpcServer.Serve(lis)
+	grpcServer.Stop() // in case Serve failed on its own
+	return errors.Join(serveErr, topics.Close())
 }

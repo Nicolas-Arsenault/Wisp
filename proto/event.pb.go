@@ -21,16 +21,271 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-type SubscribeRequest struct {
+type DescribeTopicRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *DescribeTopicRequest) Reset() {
+	*x = DescribeTopicRequest{}
+	mi := &file_proto_event_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DescribeTopicRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DescribeTopicRequest) ProtoMessage() {}
+
+func (x *DescribeTopicRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DescribeTopicRequest.ProtoReflect.Descriptor instead.
+func (*DescribeTopicRequest) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *DescribeTopicRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+type TopicInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	NumShards     int32                  `protobuf:"varint,2,opt,name=num_shards,json=numShards,proto3" json:"num_shards,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TopicInfo) Reset() {
+	*x = TopicInfo{}
+	mi := &file_proto_event_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TopicInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TopicInfo) ProtoMessage() {}
+
+func (x *TopicInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TopicInfo.ProtoReflect.Descriptor instead.
+func (*TopicInfo) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *TopicInfo) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *TopicInfo) GetNumShards() int32 {
+	if x != nil {
+		return x.NumShards
+	}
+	return 0
+}
+
+type PublishRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// request_id is chosen by the producer and echoed in the ack.
+	RequestId uint64 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Topic     string `protobuf:"bytes,2,opt,name=topic,proto3" json:"topic,omitempty"`
+	// shard is hash(partition key) % num_shards, computed by the producer.
+	Shard int32 `protobuf:"varint,3,opt,name=shard,proto3" json:"shard,omitempty"`
+	// payload must be a JSON object. It is stored as-is.
+	Payload       []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishRequest) Reset() {
+	*x = PublishRequest{}
+	mi := &file_proto_event_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishRequest) ProtoMessage() {}
+
+func (x *PublishRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishRequest.ProtoReflect.Descriptor instead.
+func (*PublishRequest) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PublishRequest) GetRequestId() uint64 {
+	if x != nil {
+		return x.RequestId
+	}
+	return 0
+}
+
+func (x *PublishRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *PublishRequest) GetShard() int32 {
+	if x != nil {
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *PublishRequest) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+type PublishAck struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RequestId uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Shard     int32                  `protobuf:"varint,2,opt,name=shard,proto3" json:"shard,omitempty"`
+	// event_id is the record's position in its shard (0, 1, 2, ...).
+	// Only set when error_code is 0.
+	EventId uint64 `protobuf:"varint,3,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	// error_code is a gRPC status code (google.golang.org/grpc/codes);
+	// 0 (OK) means the record is stored on disk.
+	ErrorCode     int32  `protobuf:"varint,4,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string `protobuf:"bytes,5,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishAck) Reset() {
+	*x = PublishAck{}
+	mi := &file_proto_event_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishAck) ProtoMessage() {}
+
+func (x *PublishAck) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishAck.ProtoReflect.Descriptor instead.
+func (*PublishAck) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *PublishAck) GetRequestId() uint64 {
+	if x != nil {
+		return x.RequestId
+	}
+	return 0
+}
+
+func (x *PublishAck) GetShard() int32 {
+	if x != nil {
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *PublishAck) GetEventId() uint64 {
+	if x != nil {
+		return x.EventId
+	}
+	return 0
+}
+
+func (x *PublishAck) GetErrorCode() int32 {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return 0
+}
+
+func (x *PublishAck) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+type SubscribeRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	Shard int32                  `protobuf:"varint,2,opt,name=shard,proto3" json:"shard,omitempty"`
+	// start_id is the first event_id to send. Ignored when latest is true.
+	StartId uint64 `protobuf:"varint,3,opt,name=start_id,json=startId,proto3" json:"start_id,omitempty"`
+	// latest starts at the end of the shard: only new records are sent.
+	Latest bool `protobuf:"varint,4,opt,name=latest,proto3" json:"latest,omitempty"`
+	// max_bytes caps the payload bytes in one EventBatch (0 = broker default).
+	// A batch always holds at least one record.
+	MaxBytes      uint32 `protobuf:"varint,5,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_proto_event_proto_msgTypes[0]
+	mi := &file_proto_event_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -42,7 +297,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_event_proto_msgTypes[0]
+	mi := &file_proto_event_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -55,7 +310,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_event_proto_rawDescGZIP(), []int{0}
+	return file_proto_event_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *SubscribeRequest) GetTopic() string {
@@ -65,30 +320,59 @@ func (x *SubscribeRequest) GetTopic() string {
 	return ""
 }
 
-type EventResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	EventId       string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
-	Timestamp     int64                  `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+func (x *SubscribeRequest) GetShard() int32 {
+	if x != nil {
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *SubscribeRequest) GetStartId() uint64 {
+	if x != nil {
+		return x.StartId
+	}
+	return 0
+}
+
+func (x *SubscribeRequest) GetLatest() bool {
+	if x != nil {
+		return x.Latest
+	}
+	return false
+}
+
+func (x *SubscribeRequest) GetMaxBytes() uint32 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+type Event struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	EventId uint64                 `protobuf:"varint,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	Payload []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	// timestamp is when the broker stored the record, in Unix milliseconds.
+	Timestamp     int64 `protobuf:"varint,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *EventResponse) Reset() {
-	*x = EventResponse{}
-	mi := &file_proto_event_proto_msgTypes[1]
+func (x *Event) Reset() {
+	*x = Event{}
+	mi := &file_proto_event_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *EventResponse) String() string {
+func (x *Event) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*EventResponse) ProtoMessage() {}
+func (*Event) ProtoMessage() {}
 
-func (x *EventResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_event_proto_msgTypes[1]
+func (x *Event) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -99,55 +383,56 @@ func (x *EventResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use EventResponse.ProtoReflect.Descriptor instead.
-func (*EventResponse) Descriptor() ([]byte, []int) {
-	return file_proto_event_proto_rawDescGZIP(), []int{1}
+// Deprecated: Use Event.ProtoReflect.Descriptor instead.
+func (*Event) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{5}
 }
 
-func (x *EventResponse) GetEventId() string {
+func (x *Event) GetEventId() uint64 {
 	if x != nil {
 		return x.EventId
 	}
-	return ""
+	return 0
 }
 
-func (x *EventResponse) GetPayload() []byte {
+func (x *Event) GetPayload() []byte {
 	if x != nil {
 		return x.Payload
 	}
 	return nil
 }
 
-func (x *EventResponse) GetTimestamp() int64 {
+func (x *Event) GetTimestamp() int64 {
 	if x != nil {
 		return x.Timestamp
 	}
 	return 0
 }
 
-type EventRequest struct {
+type EventBatch struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	Shard         int32                  `protobuf:"varint,2,opt,name=shard,proto3" json:"shard,omitempty"`
+	Events        []*Event               `protobuf:"bytes,3,rep,name=events,proto3" json:"events,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *EventRequest) Reset() {
-	*x = EventRequest{}
-	mi := &file_proto_event_proto_msgTypes[2]
+func (x *EventBatch) Reset() {
+	*x = EventBatch{}
+	mi := &file_proto_event_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *EventRequest) String() string {
+func (x *EventBatch) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*EventRequest) ProtoMessage() {}
+func (*EventBatch) ProtoMessage() {}
 
-func (x *EventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_event_proto_msgTypes[2]
+func (x *EventBatch) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -158,88 +443,77 @@ func (x *EventRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use EventRequest.ProtoReflect.Descriptor instead.
-func (*EventRequest) Descriptor() ([]byte, []int) {
-	return file_proto_event_proto_rawDescGZIP(), []int{2}
+// Deprecated: Use EventBatch.ProtoReflect.Descriptor instead.
+func (*EventBatch) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{6}
 }
 
-func (x *EventRequest) GetTopic() string {
+func (x *EventBatch) GetTopic() string {
 	if x != nil {
 		return x.Topic
 	}
 	return ""
 }
 
-func (x *EventRequest) GetPayload() []byte {
+func (x *EventBatch) GetShard() int32 {
 	if x != nil {
-		return x.Payload
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *EventBatch) GetEvents() []*Event {
+	if x != nil {
+		return x.Events
 	}
 	return nil
-}
-
-type PublishResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PublishResponse) Reset() {
-	*x = PublishResponse{}
-	mi := &file_proto_event_proto_msgTypes[3]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PublishResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PublishResponse) ProtoMessage() {}
-
-func (x *PublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_event_proto_msgTypes[3]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PublishResponse.ProtoReflect.Descriptor instead.
-func (*PublishResponse) Descriptor() ([]byte, []int) {
-	return file_proto_event_proto_rawDescGZIP(), []int{3}
-}
-
-func (x *PublishResponse) GetSuccess() bool {
-	if x != nil {
-		return x.Success
-	}
-	return false
 }
 
 var File_proto_event_proto protoreflect.FileDescriptor
 
 const file_proto_event_proto_rawDesc = "" +
 	"\n" +
-	"\x11proto/event.proto\x12\x04wisp\"(\n" +
+	"\x11proto/event.proto\x12\x04wisp\",\n" +
+	"\x14DescribeTopicRequest\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\"@\n" +
+	"\tTopicInfo\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1d\n" +
+	"\n" +
+	"num_shards\x18\x02 \x01(\x05R\tnumShards\"u\n" +
+	"\x0ePublishRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
+	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05shard\x18\x03 \x01(\x05R\x05shard\x12\x18\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\"\xa0\x01\n" +
+	"\n" +
+	"PublishAck\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
+	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +
+	"\bevent_id\x18\x03 \x01(\x04R\aeventId\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x04 \x01(\x05R\terrorCode\x12#\n" +
+	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\"\x8e\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\"b\n" +
-	"\rEventResponse\x12\x19\n" +
-	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x18\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +
+	"\bstart_id\x18\x03 \x01(\x04R\astartId\x12\x16\n" +
+	"\x06latest\x18\x04 \x01(\bR\x06latest\x12\x1b\n" +
+	"\tmax_bytes\x18\x05 \x01(\rR\bmaxBytes\"Z\n" +
+	"\x05Event\x12\x19\n" +
+	"\bevent_id\x18\x01 \x01(\x04R\aeventId\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1c\n" +
-	"\ttimestamp\x18\x03 \x01(\x03R\ttimestamp\">\n" +
-	"\fEventRequest\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x18\n" +
-	"\apayload\x18\x02 \x01(\fR\apayload\"+\n" +
-	"\x0fPublishResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess2\x89\x01\n" +
-	"\vEventBroker\x129\n" +
-	"\fPublishEvent\x12\x12.wisp.EventRequest\x1a\x15.wisp.PublishResponse\x12?\n" +
-	"\x0eSubscribeTopic\x12\x16.wisp.SubscribeRequest\x1a\x13.wisp.EventResponse0\x01B\fZ\n" +
+	"\ttimestamp\x18\x03 \x01(\x03R\ttimestamp\"]\n" +
+	"\n" +
+	"EventBatch\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12#\n" +
+	"\x06events\x18\x03 \x03(\v2\v.wisp.EventR\x06events2\xbb\x01\n" +
+	"\vEventBroker\x12<\n" +
+	"\rDescribeTopic\x12\x1a.wisp.DescribeTopicRequest\x1a\x0f.wisp.TopicInfo\x125\n" +
+	"\aPublish\x12\x14.wisp.PublishRequest\x1a\x10.wisp.PublishAck(\x010\x01\x127\n" +
+	"\tSubscribe\x12\x16.wisp.SubscribeRequest\x1a\x10.wisp.EventBatch0\x01B\fZ\n" +
 	"wisp/protob\x06proto3"
 
 var (
@@ -254,23 +528,29 @@ func file_proto_event_proto_rawDescGZIP() []byte {
 	return file_proto_event_proto_rawDescData
 }
 
-var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_proto_event_proto_goTypes = []any{
-	(*SubscribeRequest)(nil), // 0: wisp.SubscribeRequest
-	(*EventResponse)(nil),    // 1: wisp.EventResponse
-	(*EventRequest)(nil),     // 2: wisp.EventRequest
-	(*PublishResponse)(nil),  // 3: wisp.PublishResponse
+	(*DescribeTopicRequest)(nil), // 0: wisp.DescribeTopicRequest
+	(*TopicInfo)(nil),            // 1: wisp.TopicInfo
+	(*PublishRequest)(nil),       // 2: wisp.PublishRequest
+	(*PublishAck)(nil),           // 3: wisp.PublishAck
+	(*SubscribeRequest)(nil),     // 4: wisp.SubscribeRequest
+	(*Event)(nil),                // 5: wisp.Event
+	(*EventBatch)(nil),           // 6: wisp.EventBatch
 }
 var file_proto_event_proto_depIdxs = []int32{
-	2, // 0: wisp.EventBroker.PublishEvent:input_type -> wisp.EventRequest
-	0, // 1: wisp.EventBroker.SubscribeTopic:input_type -> wisp.SubscribeRequest
-	3, // 2: wisp.EventBroker.PublishEvent:output_type -> wisp.PublishResponse
-	1, // 3: wisp.EventBroker.SubscribeTopic:output_type -> wisp.EventResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	5, // 0: wisp.EventBatch.events:type_name -> wisp.Event
+	0, // 1: wisp.EventBroker.DescribeTopic:input_type -> wisp.DescribeTopicRequest
+	2, // 2: wisp.EventBroker.Publish:input_type -> wisp.PublishRequest
+	4, // 3: wisp.EventBroker.Subscribe:input_type -> wisp.SubscribeRequest
+	1, // 4: wisp.EventBroker.DescribeTopic:output_type -> wisp.TopicInfo
+	3, // 5: wisp.EventBroker.Publish:output_type -> wisp.PublishAck
+	6, // 6: wisp.EventBroker.Subscribe:output_type -> wisp.EventBatch
+	4, // [4:7] is the sub-list for method output_type
+	1, // [1:4] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_event_proto_init() }
@@ -284,7 +564,7 @@ func file_proto_event_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_event_proto_rawDesc), len(file_proto_event_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

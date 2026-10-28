@@ -1,56 +1,69 @@
 # Broker
 
-Def: Server that handles consumer subscription to a topic. Also handles producers pushing to a topic.
-
-Supports actions such as:
-
-- creating a new topic
-- pushing to a topic
-- ...
+Def: server that producers publish to and consumers read from.
 
 ## gRPC server (`main.go`)
 
-The broker listens on port 50051 (`go run .`). It has two calls.
+Listens on `:50051` (`go run .`) and stores data in `../data`, relative to where it's started. At startup it opens every shard already on disk.
 
-### `PublishEvent(topic, payload)`
+### `DescribeTopic(topic)`
 
-1. **Write:** writes the payload to the topic's stream with `stream.WriteToStream`. That adds the shard's `seq_n`.
-2. **Send:** sends the event *as stored* to every consumer currently subscribed to the topic, as an `EventResponse`:
-   - **`event_id`:** `"<topic>/<shard>/<seq_n>"`, e.g. `orders/3/41`. It says exactly where the event is on disk. It's unique while the process runs; `seq_n` restarts at 0 on restart.
-   - **`payload`:** the stored JSON, including `seq_n`.
-   - **`timestamp`:** when the broker sent the event, in Unix milliseconds.
-3. **Reply:** returns `Success: true`.
+Returns the topic's number of shards and creates the topic if needed. Producers call it once so they can hash keys to shards.
 
-Errors, where nothing is stored and nothing is sent:
+### `Publish` (bidirectional stream)
 
-- **`codes.InvalidArgument`:** the payload isn't a JSON object.
-- **`codes.Internal`:** the event couldn't be written to disk.
+One long-lived stream per producer.
 
-**Breaking change:** a failed write used to return `Success: true`. It now returns these errors.
+- **Request:** `{request_id, topic, shard, payload}`. The shard is computed by the producer.
+- **Writing:** each request is put on that shard's queue, in the order received.
+- **Ack:** each request gets one ack, in request order, once the record is on disk: `{request_id, shard, event_id}`.
+- **Errors:** a bad request gets an ack with `error_code` set, and the stream stays open.
 
-### `SubscribeTopic(topic)`
+  | Error | Cause |
+  |---|---|
+  | `INVALID_ARGUMENT` | not a JSON object, bad topic name, or shard out of range |
+  | `RESOURCE_EXHAUSTED` | the shard's index is full |
+  | `UNAVAILABLE` | the broker is shutting down |
+  | `INTERNAL` | the write failed |
+- **Backpressure:** if a shard queue is full, or 256 acks are waiting, the broker stops reading the stream until there is room.
 
-Registers the caller as a consumer of `topic` and streams it every event published on that topic **from then on**. Older events aren't replayed yet. The consumer is removed when it disconnects or a send fails.
+### `Subscribe(topic, shard, start_id, latest, max_bytes)`
 
-### How sending works
+Streams **one shard**.
 
-- **One buffer per consumer:** each consumer gets a channel that holds up to `subscriberBuffer` (64) events. `PublishEvent` only puts events on the channel; the consumer's own `SubscribeTopic` call is the only one that calls `Send`. gRPC doesn't allow two goroutines to `Send` on the same stream at once.
-- **Slow consumers:** if a consumer's buffer is full, the event is **dropped for that consumer** and a warning is logged. Publishing is never slowed down by a consumer, and the event is still on disk. With `event_id` the consumer can see the gap.
-- **Order:** events published one after another on a topic reach consumers in that order. Events published *at the same time* may arrive in a different order than their `seq_n`.
-- **Logging:** `main.go` logs with `slog` (Debug for each event, Info for subscribe and unsubscribe, Warn for dropped or failed sends).
+- **History, then live:** first every stored record from `start_id`, then each new record as soon as it's stored, until the consumer leaves.
+- **`latest`:** starts at the end of the shard, so only new records are sent.
+- **Batches:** records come in `EventBatch` messages of at most `max_bytes` of payload. The default is 1 MiB and the cap is about 4 MiB (gRPC's default message limit). A batch always holds at least one record.
+- **Slow consumers:** records are read from disk, so a slow consumer only falls behind; it never loses records.
+- **Errors:**
 
-### Tests (`main_test.go`)
+  | Error | Cause |
+  |---|---|
+  | `NOT_FOUND` | unknown topic |
+  | `INVALID_ARGUMENT` | bad shard |
+  | `OUT_OF_RANGE` | `start_id` after the end of the shard |
+  | `UNAVAILABLE` | the broker is shutting down |
 
-- **Publishing:** a direct call and a gRPC round trip; invalid payload → `InvalidArgument` with nothing written; write failure → `Internal`.
-- **Subscribing:** two consumers of a topic both get every event in order, with the right `event_id`, payload and timestamp. A consumer of another topic gets only its own topic's events.
-- **Cleanup:** cancelling a subscription removes the consumer.
-- **Slow consumer:** a full buffer doesn't block `broadcast`, the event is dropped for that consumer, and other consumers still get it.
+### Shutdown
 
-Isolation:
+On Ctrl+C or SIGTERM, the broker:
 
-- **Temp working directory:** each test changes into a temp directory, because `stream` writes to `../data` relative to the working directory.
-- **New topic per test:** each test uses a new topic, because the round-robin position and shard sequences last for the whole test binary.
-- **Wait for registration:** tests wait until the broker has registered a consumer before publishing, because `SubscribeTopic` registers on the server side after the client call returns.
-- **Deadline:** subscriptions have a 5 s deadline, so a missing event fails the test instead of hanging.
+1. Disconnects every client.
+2. Waits for the handlers to return.
+3. Closes the shards. Records already queued are still stored.
+
+## Breaking changes
+
+- **RPCs:** `PublishEvent` and `SubscribeTopic` are replaced by `DescribeTopic`, `Publish` and `Subscribe`.
+- **Event id:** now a number per shard (it was the string `topic/shard/seq_n`).
+- **Payloads:** no longer contain `seq_n`.
+- **On-disk format:** new, and old data isn't supported.
+
+## Tests (`main_test.go`)
+
+These run the real broker over an in-memory connection, with its data in a temp dir:
+
+- **Publish:** acks and error acks.
+- **Subscribe:** replay then live, `latest`, `max_bytes` batching, and errors.
 
 Run with `go test -race .`.

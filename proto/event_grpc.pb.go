@@ -19,16 +19,25 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	EventBroker_PublishEvent_FullMethodName   = "/wisp.EventBroker/PublishEvent"
-	EventBroker_SubscribeTopic_FullMethodName = "/wisp.EventBroker/SubscribeTopic"
+	EventBroker_DescribeTopic_FullMethodName = "/wisp.EventBroker/DescribeTopic"
+	EventBroker_Publish_FullMethodName       = "/wisp.EventBroker/Publish"
+	EventBroker_Subscribe_FullMethodName     = "/wisp.EventBroker/Subscribe"
 )
 
 // EventBrokerClient is the client API for EventBroker service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type EventBrokerClient interface {
-	PublishEvent(ctx context.Context, in *EventRequest, opts ...grpc.CallOption) (*PublishResponse, error)
-	SubscribeTopic(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventResponse], error)
+	// DescribeTopic returns how many shards a topic has, creating the topic if
+	// it doesn't exist yet. Producers call it once to hash keys to shards.
+	DescribeTopic(ctx context.Context, in *DescribeTopicRequest, opts ...grpc.CallOption) (*TopicInfo, error)
+	// Publish is a long-lived producer stream. Each request goes to the shard
+	// the producer chose; the broker answers every request with one ack, in
+	// request order.
+	Publish(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PublishRequest, PublishAck], error)
+	// Subscribe streams one shard from start_id (or from its end if latest is
+	// set): first every stored record, then new records as they are written.
+	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventBatch], error)
 }
 
 type eventBrokerClient struct {
@@ -39,23 +48,36 @@ func NewEventBrokerClient(cc grpc.ClientConnInterface) EventBrokerClient {
 	return &eventBrokerClient{cc}
 }
 
-func (c *eventBrokerClient) PublishEvent(ctx context.Context, in *EventRequest, opts ...grpc.CallOption) (*PublishResponse, error) {
+func (c *eventBrokerClient) DescribeTopic(ctx context.Context, in *DescribeTopicRequest, opts ...grpc.CallOption) (*TopicInfo, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PublishResponse)
-	err := c.cc.Invoke(ctx, EventBroker_PublishEvent_FullMethodName, in, out, cOpts...)
+	out := new(TopicInfo)
+	err := c.cc.Invoke(ctx, EventBroker_DescribeTopic_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *eventBrokerClient) SubscribeTopic(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventResponse], error) {
+func (c *eventBrokerClient) Publish(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PublishRequest, PublishAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &EventBroker_ServiceDesc.Streams[0], EventBroker_SubscribeTopic_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &EventBroker_ServiceDesc.Streams[0], EventBroker_Publish_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[SubscribeRequest, EventResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[PublishRequest, PublishAck]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_PublishClient = grpc.BidiStreamingClient[PublishRequest, PublishAck]
+
+func (c *eventBrokerClient) Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &EventBroker_ServiceDesc.Streams[1], EventBroker_Subscribe_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SubscribeRequest, EventBatch]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -66,14 +88,22 @@ func (c *eventBrokerClient) SubscribeTopic(ctx context.Context, in *SubscribeReq
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type EventBroker_SubscribeTopicClient = grpc.ServerStreamingClient[EventResponse]
+type EventBroker_SubscribeClient = grpc.ServerStreamingClient[EventBatch]
 
 // EventBrokerServer is the server API for EventBroker service.
 // All implementations must embed UnimplementedEventBrokerServer
 // for forward compatibility.
 type EventBrokerServer interface {
-	PublishEvent(context.Context, *EventRequest) (*PublishResponse, error)
-	SubscribeTopic(*SubscribeRequest, grpc.ServerStreamingServer[EventResponse]) error
+	// DescribeTopic returns how many shards a topic has, creating the topic if
+	// it doesn't exist yet. Producers call it once to hash keys to shards.
+	DescribeTopic(context.Context, *DescribeTopicRequest) (*TopicInfo, error)
+	// Publish is a long-lived producer stream. Each request goes to the shard
+	// the producer chose; the broker answers every request with one ack, in
+	// request order.
+	Publish(grpc.BidiStreamingServer[PublishRequest, PublishAck]) error
+	// Subscribe streams one shard from start_id (or from its end if latest is
+	// set): first every stored record, then new records as they are written.
+	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[EventBatch]) error
 	mustEmbedUnimplementedEventBrokerServer()
 }
 
@@ -84,11 +114,14 @@ type EventBrokerServer interface {
 // pointer dereference when methods are called.
 type UnimplementedEventBrokerServer struct{}
 
-func (UnimplementedEventBrokerServer) PublishEvent(context.Context, *EventRequest) (*PublishResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method PublishEvent not implemented")
+func (UnimplementedEventBrokerServer) DescribeTopic(context.Context, *DescribeTopicRequest) (*TopicInfo, error) {
+	return nil, status.Error(codes.Unimplemented, "method DescribeTopic not implemented")
 }
-func (UnimplementedEventBrokerServer) SubscribeTopic(*SubscribeRequest, grpc.ServerStreamingServer[EventResponse]) error {
-	return status.Error(codes.Unimplemented, "method SubscribeTopic not implemented")
+func (UnimplementedEventBrokerServer) Publish(grpc.BidiStreamingServer[PublishRequest, PublishAck]) error {
+	return status.Error(codes.Unimplemented, "method Publish not implemented")
+}
+func (UnimplementedEventBrokerServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[EventBatch]) error {
+	return status.Error(codes.Unimplemented, "method Subscribe not implemented")
 }
 func (UnimplementedEventBrokerServer) mustEmbedUnimplementedEventBrokerServer() {}
 func (UnimplementedEventBrokerServer) testEmbeddedByValue()                     {}
@@ -111,34 +144,41 @@ func RegisterEventBrokerServer(s grpc.ServiceRegistrar, srv EventBrokerServer) {
 	s.RegisterService(&EventBroker_ServiceDesc, srv)
 }
 
-func _EventBroker_PublishEvent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(EventRequest)
+func _EventBroker_DescribeTopic_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeTopicRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(EventBrokerServer).PublishEvent(ctx, in)
+		return srv.(EventBrokerServer).DescribeTopic(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: EventBroker_PublishEvent_FullMethodName,
+		FullMethod: EventBroker_DescribeTopic_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EventBrokerServer).PublishEvent(ctx, req.(*EventRequest))
+		return srv.(EventBrokerServer).DescribeTopic(ctx, req.(*DescribeTopicRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _EventBroker_SubscribeTopic_Handler(srv interface{}, stream grpc.ServerStream) error {
+func _EventBroker_Publish_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(EventBrokerServer).Publish(&grpc.GenericServerStream[PublishRequest, PublishAck]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_PublishServer = grpc.BidiStreamingServer[PublishRequest, PublishAck]
+
+func _EventBroker_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(EventBrokerServer).SubscribeTopic(m, &grpc.GenericServerStream[SubscribeRequest, EventResponse]{ServerStream: stream})
+	return srv.(EventBrokerServer).Subscribe(m, &grpc.GenericServerStream[SubscribeRequest, EventBatch]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type EventBroker_SubscribeTopicServer = grpc.ServerStreamingServer[EventResponse]
+type EventBroker_SubscribeServer = grpc.ServerStreamingServer[EventBatch]
 
 // EventBroker_ServiceDesc is the grpc.ServiceDesc for EventBroker service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -148,14 +188,20 @@ var EventBroker_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*EventBrokerServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "PublishEvent",
-			Handler:    _EventBroker_PublishEvent_Handler,
+			MethodName: "DescribeTopic",
+			Handler:    _EventBroker_DescribeTopic_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "SubscribeTopic",
-			Handler:       _EventBroker_SubscribeTopic_Handler,
+			StreamName:    "Publish",
+			Handler:       _EventBroker_Publish_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "Subscribe",
+			Handler:       _EventBroker_Subscribe_Handler,
 			ServerStreams: true,
 		},
 	},
