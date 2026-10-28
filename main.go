@@ -60,7 +60,7 @@ func (s *Server) PublishEvent(ctx context.Context, req *pb.EventRequest) (*pb.Pu
 	// Consumer group that gets shards assigned... and auto rebalance
 	written, err := stream.WriteToStream(req.Payload, req.Topic)
 	if errors.Is(err, shards.ErrInvalidPayload) {
-		return nil, status.Errorf(codes.InvalidArgument, "payload must be a JSON object: %v", err)
+		return nil, status.Error(codes.InvalidArgument, err.Error()) // err already says "payload must be a JSON object"
 	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "could not write event: %v", err)
