@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! Please check the docs in `docs/` first, since some limits are documented on purpose (e.g. no record framing yet).
+        Thanks for reporting! Please check the docs in `docs/` first, since some limits are documented on purpose (e.g. a shard's index is fixed-size).
 
   - type: dropdown
     id: component

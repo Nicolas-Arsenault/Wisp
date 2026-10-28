@@ -4,26 +4,70 @@ package wisp;
 option go_package = "wisp/proto";
 
 service EventBroker {
-  rpc PublishEvent (EventRequest) returns (PublishResponse);
-rpc SubscribeTopic (SubscribeRequest) returns (stream EventResponse);
+  // DescribeTopic returns how many shards a topic has, creating the topic if
+  // it doesn't exist yet. Producers call it once to hash keys to shards.
+  rpc DescribeTopic (DescribeTopicRequest) returns (TopicInfo);
+  // Publish is a long-lived producer stream. Each request goes to the shard
+  // the producer chose; the broker answers every request with one ack, in
+  // request order.
+  rpc Publish (stream PublishRequest) returns (stream PublishAck);
+  // Subscribe streams one shard from start_id (or from its end if latest is
+  // set): first every stored record, then new records as they are written.
+  rpc Subscribe (SubscribeRequest) returns (stream EventBatch);
 }
 
-message SubscribeRequest{
+message DescribeTopicRequest {
   string topic = 1;
 }
 
-message EventResponse {
-  string event_id = 1;
+message TopicInfo {
+  string topic = 1;
+  int32 num_shards = 2;
+}
+
+message PublishRequest {
+  // request_id is chosen by the producer and echoed in the ack.
+  uint64 request_id = 1;
+  string topic = 2;
+  // shard is hash(partition key) % num_shards, computed by the producer.
+  int32 shard = 3;
+  // payload must be a JSON object. It is stored as-is.
+  bytes payload = 4;
+}
+
+message PublishAck {
+  uint64 request_id = 1;
+  int32 shard = 2;
+  // event_id is the record's position in its shard (0, 1, 2, ...).
+  // Only set when error_code is 0.
+  uint64 event_id = 3;
+  // error_code is a gRPC status code (google.golang.org/grpc/codes);
+  // 0 (OK) means the record is stored on disk.
+  int32 error_code = 4;
+  string error_message = 5;
+}
+
+message SubscribeRequest {
+  string topic = 1;
+  int32 shard = 2;
+  // start_id is the first event_id to send. Ignored when latest is true.
+  uint64 start_id = 3;
+  // latest starts at the end of the shard: only new records are sent.
+  bool latest = 4;
+  // max_bytes caps the payload bytes in one EventBatch (0 = broker default).
+  // A batch always holds at least one record.
+  uint32 max_bytes = 5;
+}
+
+message Event {
+  uint64 event_id = 1;
   bytes payload = 2;
+  // timestamp is when the broker stored the record, in Unix milliseconds.
   int64 timestamp = 3;
 }
 
-
-message EventRequest {
+message EventBatch {
   string topic = 1;
-  bytes payload = 2;
-}
-
-message PublishResponse {
-  bool success = 1;
+  int32 shard = 2;
+  repeated Event events = 3;
 }

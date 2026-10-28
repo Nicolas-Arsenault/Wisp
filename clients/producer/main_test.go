@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"wisp/partition"
 	pb "wisp/proto"
 
 	"google.golang.org/grpc"
@@ -15,37 +18,57 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-// fakeBroker records every published event. reply decides the response to
-// each one; nil reply accepts everything.
+const testShards = 5
+
+// fakeBroker records every published request. code decides the ack's error
+// code for each one; nil accepts everything.
 type fakeBroker struct {
 	pb.UnimplementedEventBrokerServer
-	reply func(req *pb.EventRequest) error
+	code func(req *pb.PublishRequest) codes.Code
 
 	mu       sync.Mutex
-	received []*pb.EventRequest
+	received []*pb.PublishRequest
 }
 
-func (f *fakeBroker) PublishEvent(_ context.Context, req *pb.EventRequest) (*pb.PublishResponse, error) {
-	f.mu.Lock()
-	f.received = append(f.received, req)
-	f.mu.Unlock()
-	if f.reply != nil {
-		if err := f.reply(req); err != nil {
-			return nil, err
+func (f *fakeBroker) DescribeTopic(_ context.Context, req *pb.DescribeTopicRequest) (*pb.TopicInfo, error) {
+	return &pb.TopicInfo{Topic: req.GetTopic(), NumShards: testShards}, nil
+}
+
+func (f *fakeBroker) Publish(stream pb.EventBroker_PublishServer) error {
+	for {
+		req, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		f.mu.Lock()
+		f.received = append(f.received, req)
+		f.mu.Unlock()
+
+		ack := &pb.PublishAck{RequestId: req.GetRequestId(), Shard: req.GetShard()}
+		if f.code != nil {
+			ack.ErrorCode = int32(f.code(req))
+		}
+		if err := stream.Send(ack); err != nil {
+			return err
 		}
 	}
-	return &pb.PublishResponse{Success: true}, nil
 }
 
-// payloads returns the payloads the broker received, in order.
-func (f *fakeBroker) payloads() []string {
+func (f *fakeBroker) requests() []*pb.PublishRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return append([]*pb.PublishRequest{}, f.received...)
+}
+
+func (f *fakeBroker) payloads() string {
 	var out []string
-	for _, req := range f.received {
+	for _, req := range f.requests() {
 		out = append(out, string(req.GetPayload()))
 	}
-	return out
+	return strings.Join(out, ",")
 }
 
 // newClient serves broker on an in-memory listener and returns a client for it.
@@ -72,87 +95,92 @@ func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
 
 func TestRunPublishesEachLine(t *testing.T) {
 	broker := &fakeBroker{}
-	client := newClient(t, broker)
 	in := "{\"n\":1}\n\n   \n  {\"n\":2}  \n{\"n\":3}" // blank lines, padding, no final newline
 
-	sent, err := run(t.Context(), client, "sensors", strings.NewReader(in))
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	sent, err := run(t.Context(), newClient(t, broker), "sensors", "", strings.NewReader(in))
+	if err != nil || sent != 3 {
+		t.Fatalf("run = %d, %v, want 3, nil", sent, err)
 	}
-	if sent != 3 {
-		t.Errorf("sent = %d, want 3", sent)
+	if got, want := broker.payloads(), `{"n":1},{"n":2},{"n":3}`; got != want {
+		t.Errorf("broker got %s, want %s", got, want)
 	}
-	got, want := broker.payloads(), []string{`{"n":1}`, `{"n":2}`, `{"n":3}`}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("broker got %v, want %v", got, want)
-	}
-	for _, req := range broker.received {
+	for _, req := range broker.requests() {
 		if req.GetTopic() != "sensors" {
 			t.Errorf("topic = %q, want sensors", req.GetTopic())
 		}
 	}
 }
 
+// Each line goes to the shard of its key.
+func TestRunHashesKeyToShard(t *testing.T) {
+	broker := &fakeBroker{}
+	in := `{"dev":"a","n":1}` + "\n" + `{"dev":42}` + "\n" + `{"other":1}` + "\n"
+
+	if _, err := run(t.Context(), newClient(t, broker), "t", "dev", strings.NewReader(in)); err != nil {
+		t.Fatal(err)
+	}
+	want := []int{
+		partition.Shard([]byte("a"), testShards),  // string: without quotes
+		partition.Shard([]byte("42"), testShards), // number: as JSON text
+		partition.Shard(nil, testShards),          // no field: empty key
+	}
+	for i, req := range broker.requests() {
+		if int(req.GetShard()) != want[i] {
+			t.Errorf("line %d went to shard %d, want %d", i+1, req.GetShard(), want[i])
+		}
+	}
+}
+
 func TestRunEmptyInput(t *testing.T) {
 	broker := &fakeBroker{}
-	sent, err := run(t.Context(), newClient(t, broker), "t", strings.NewReader(""))
+	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader(""))
 	if err != nil || sent != 0 {
 		t.Errorf("run = %d, %v, want 0, nil", sent, err)
-	}
-	if len(broker.payloads()) != 0 {
-		t.Errorf("broker got %v, want nothing", broker.payloads())
 	}
 }
 
 // A rejected event is skipped; the following ones are still published.
 func TestRunSkipsInvalidEvents(t *testing.T) {
-	broker := &fakeBroker{reply: func(req *pb.EventRequest) error {
+	broker := &fakeBroker{code: func(req *pb.PublishRequest) codes.Code {
 		if string(req.GetPayload()) == "bad" {
-			return status.Error(codes.InvalidArgument, "payload must be a JSON object")
+			return codes.InvalidArgument
 		}
-		return nil
+		return codes.OK
 	}}
 
-	sent, err := run(t.Context(), newClient(t, broker), "t", strings.NewReader("{\"n\":1}\nbad\n{\"n\":2}\n"))
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\nbad\n{\"n\":2}\n"))
+	if err != nil || sent != 2 {
+		t.Fatalf("run = %d, %v, want 2, nil", sent, err)
 	}
-	if sent != 2 {
-		t.Errorf("sent = %d, want 2 (bad line not counted)", sent)
-	}
-	if got := broker.payloads(); len(got) != 3 {
-		t.Errorf("broker got %v, want all 3 lines tried", got)
+	if len(broker.requests()) != 3 {
+		t.Errorf("broker got %s, want all 3 lines", broker.payloads())
 	}
 }
 
-// Any other error stops the producer: later lines are not sent.
+// Any other error ack stops the producer and names the line.
 func TestRunStopsOnBrokerError(t *testing.T) {
-	broker := &fakeBroker{reply: func(req *pb.EventRequest) error {
+	broker := &fakeBroker{code: func(req *pb.PublishRequest) codes.Code {
 		if string(req.GetPayload()) == `{"n":2}` {
-			return status.Error(codes.Internal, "could not write event")
+			return codes.Internal
 		}
-		return nil
+		return codes.OK
 	}}
 
-	sent, err := run(t.Context(), newClient(t, broker), "t", strings.NewReader("{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n"))
-	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "line 2") {
+	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\n{\"n\":2}\n"))
+	if status.Code(errors.Unwrap(err)) != codes.Internal || !strings.Contains(err.Error(), "line 2") {
 		t.Fatalf("err = %v, want Internal error mentioning line 2", err)
 	}
 	if sent != 1 {
 		t.Errorf("sent = %d, want 1", sent)
 	}
-	if got := broker.payloads(); len(got) != 2 {
-		t.Errorf("broker got %v, want line 3 never sent", got)
-	}
 }
 
 func TestRunCancelledContext(t *testing.T) {
-	broker := &fakeBroker{}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	sent, err := run(ctx, newClient(t, broker), "t", strings.NewReader("{\"n\":1}\n"))
-	if status.Code(err) != codes.Canceled {
+	sent, err := run(ctx, newClient(t, &fakeBroker{}), "t", "", strings.NewReader("{\"n\":1}\n"))
+	if status.Code(errors.Unwrap(err)) != codes.Canceled && !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want Canceled", err)
 	}
 	if sent != 0 {

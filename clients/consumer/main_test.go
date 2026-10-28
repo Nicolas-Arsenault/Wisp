@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,15 +18,22 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-// fakeBroker answers SubscribeTopic with the subscribe func.
+// fakeBroker answers Subscribe with the subscribe func.
 type fakeBroker struct {
 	pb.UnimplementedEventBrokerServer
-	subscribe func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error
+	subscribe func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error
 }
 
-func (f *fakeBroker) SubscribeTopic(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error {
+func (f *fakeBroker) Subscribe(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
 	return f.subscribe(req, stream)
 }
+
+// batch builds a batch of shard 0 of topic t with one event.
+func batch(id uint64, payload string) *pb.EventBatch {
+	return &pb.EventBatch{Topic: "t", Shard: 0, Events: []*pb.Event{{EventId: id, Payload: []byte(payload)}}}
+}
+
+var testOpts = options{topic: "t", shard: 0}
 
 // newClient serves broker on an in-memory listener and returns a client for it.
 func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
@@ -55,22 +61,28 @@ func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
 const testTimestamp = 1793137200123
 
 func TestFormatEvent(t *testing.T) {
-	got := formatEvent(&pb.EventResponse{EventId: "s/0/0", Timestamp: testTimestamp, Payload: []byte(`{"seq_n":0}`)})
-	want := "s/0/0\t2026-10-27T21:40:00.123Z\t{\"seq_n\":0}"
+	got := formatEvent(&pb.EventBatch{Topic: "s", Shard: 2}, &pb.Event{EventId: 7, Timestamp: testTimestamp, Payload: []byte(`{"a":1}`)})
+	want := "s/2/7\t2026-10-27T21:40:00.123Z\t{\"a\":1}"
 	if got != want {
 		t.Errorf("formatEvent = %q, want %q", got, want)
 	}
 }
 
-// The broker sends two events, then ends the stream: both are printed and
-// run returns cleanly.
+// The broker sends two batches (3 events), then ends the stream: all are
+// printed, the request carries the options, and run returns cleanly.
 func TestRunPrintsEvents(t *testing.T) {
-	var gotTopic string
-	broker := &fakeBroker{subscribe: func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error {
-		gotTopic = req.GetTopic()
-		for i, payload := range []string{`{"n":1,"seq_n":0}`, `{"n":2,"seq_n":0}`} {
-			id := "sensors/" + strconv.Itoa(i) + "/0"
-			if err := stream.Send(&pb.EventResponse{EventId: id, Timestamp: testTimestamp, Payload: []byte(payload)}); err != nil {
+	var got *pb.SubscribeRequest
+	broker := &fakeBroker{subscribe: func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
+		got = req
+		batches := []*pb.EventBatch{
+			{Topic: "sensors", Shard: 3, Events: []*pb.Event{
+				{EventId: 5, Timestamp: testTimestamp, Payload: []byte(`{"n":1}`)},
+				{EventId: 6, Timestamp: testTimestamp, Payload: []byte(`{"n":2}`)},
+			}},
+			{Topic: "sensors", Shard: 3, Events: []*pb.Event{{EventId: 7, Timestamp: testTimestamp, Payload: []byte(`{"n":3}`)}}},
+		}
+		for _, b := range batches {
+			if err := stream.Send(b); err != nil {
 				return err
 			}
 		}
@@ -78,18 +90,17 @@ func TestRunPrintsEvents(t *testing.T) {
 	}}
 
 	var out bytes.Buffer
-	received, err := run(t.Context(), newClient(t, broker), "sensors", &out)
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	opts := options{topic: "sensors", shard: 3, offset: 5, maxBytes: 100}
+	received, err := run(t.Context(), newClient(t, broker), opts, &out)
+	if err != nil || received != 3 {
+		t.Fatalf("run = %d, %v, want 3, nil", received, err)
 	}
-	if received != 2 {
-		t.Errorf("received = %d, want 2", received)
+	if got.GetTopic() != "sensors" || got.GetShard() != 3 || got.GetStartId() != 5 || got.GetMaxBytes() != 100 || got.GetLatest() {
+		t.Errorf("request = %v", got)
 	}
-	if gotTopic != "sensors" {
-		t.Errorf("subscribed to %q, want sensors", gotTopic)
-	}
-	want := "sensors/0/0\t2026-10-27T21:40:00.123Z\t{\"n\":1,\"seq_n\":0}\n" +
-		"sensors/1/0\t2026-10-27T21:40:00.123Z\t{\"n\":2,\"seq_n\":0}\n"
+	want := "sensors/3/5\t2026-10-27T21:40:00.123Z\t{\"n\":1}\n" +
+		"sensors/3/6\t2026-10-27T21:40:00.123Z\t{\"n\":2}\n" +
+		"sensors/3/7\t2026-10-27T21:40:00.123Z\t{\"n\":3}\n"
 	if out.String() != want {
 		t.Errorf("output =\n%s\nwant\n%s", out.String(), want)
 	}
@@ -112,8 +123,8 @@ func (w *signalWriter) Write(p []byte) (int, error) {
 
 // Cancelling ctx (Ctrl+C) is a normal shutdown: run returns nil.
 func TestRunStopsCleanlyOnCancel(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error {
-		if err := stream.Send(&pb.EventResponse{EventId: "t/0/0", Payload: []byte(`{}`)}); err != nil {
+	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
+		if err := stream.Send(batch(0, `{}`)); err != nil {
 			return err
 		}
 		<-stream.Context().Done() // stay subscribed, like the real broker
@@ -128,7 +139,7 @@ func TestRunStopsCleanlyOnCancel(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		received, err := run(ctx, newClient(t, broker), "t", out)
+		received, err := run(ctx, newClient(t, broker), testOpts, out)
 		done <- result{received, err}
 	}()
 
@@ -151,11 +162,11 @@ func TestRunStopsCleanlyOnCancel(t *testing.T) {
 
 // A broker error is returned, not swallowed.
 func TestRunReturnsBrokerError(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(*pb.SubscribeRequest, pb.EventBroker_SubscribeTopicServer) error {
+	broker := &fakeBroker{subscribe: func(*pb.SubscribeRequest, pb.EventBroker_SubscribeServer) error {
 		return status.Error(codes.Unavailable, "broker shutting down")
 	}}
 
-	received, err := run(t.Context(), newClient(t, broker), "t", &bytes.Buffer{})
+	received, err := run(t.Context(), newClient(t, broker), testOpts, &bytes.Buffer{})
 	if status.Code(err) != codes.Unavailable {
 		t.Errorf("err = %v, want Unavailable", err)
 	}
@@ -170,11 +181,11 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
 
 func TestRunReturnsWriteError(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeTopicServer) error {
-		return stream.Send(&pb.EventResponse{EventId: "t/0/0", Payload: []byte(`{}`)})
+	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
+		return stream.Send(batch(0, `{}`))
 	}}
 
-	_, err := run(t.Context(), newClient(t, broker), "t", failingWriter{})
+	_, err := run(t.Context(), newClient(t, broker), testOpts, failingWriter{})
 	if err == nil || !strings.Contains(err.Error(), "broken pipe") {
 		t.Errorf("err = %v, want the write error", err)
 	}

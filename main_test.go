@@ -2,15 +2,13 @@ package main
 
 import (
 	"context"
+	"io"
 	"net"
-	"os"
-	"path/filepath"
-	"strconv"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 	pb "wisp/proto"
-	"wisp/shards"
+	"wisp/stream"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -19,44 +17,22 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-// bufSize is the in-memory buffer size of the test gRPC connection.
-const bufSize = 1024 * 1024
-
-// useTempDataDir moves the test into a temp working directory. stream writes
-// shards to "../data", so they land in <tmp>/data instead of the repo.
-// It returns that data directory.
-func useTempDataDir(t *testing.T) string {
+// newTestClient starts the broker on an in-memory connection, with its data
+// in a temp dir.
+func newTestClient(t *testing.T) pb.EventBrokerClient {
 	t.Helper()
-	root := t.TempDir()
-	work := filepath.Join(root, "work")
-	if err := os.Mkdir(work, 0o755); err != nil {
+	topics, err := stream.OpenRegistry(t.TempDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Chdir(work)
-	return filepath.Join(root, "data")
-}
-
-// readShard decodes the single record stored in shard id of topic.
-func readShard(t *testing.T, dataDir, topic, id string) string {
-	t.Helper()
-	data, err := shards.ReadFromFile(filepath.Join(dataDir, topic, id))
-	if err != nil {
-		t.Fatalf("read shard %s/%s: %v", topic, id, err)
-	}
-	return string(data)
-}
-
-// newTestClient starts the broker on an in-memory listener and returns a
-// client connected to it, plus the broker itself so tests can inspect it.
-// Both are shut down when the test ends.
-func newTestClient(t *testing.T) (pb.EventBrokerClient, *Server) {
-	t.Helper()
-	lis := bufconn.Listen(bufSize)
-	grpcServer := grpc.NewServer()
-	broker := NewBrokerServer()
-	pb.RegisterEventBrokerServer(grpcServer, broker)
-	go grpcServer.Serve(lis)
-	t.Cleanup(grpcServer.Stop)
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer(grpc.WaitForHandlers(true))
+	pb.RegisterEventBrokerServer(srv, NewBrokerServer(topics))
+	go srv.Serve(lis)
+	t.Cleanup(func() {
+		srv.Stop()
+		topics.Close()
+	})
 
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
@@ -65,236 +41,200 @@ func newTestClient(t *testing.T) (pb.EventBrokerClient, *Server) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		t.Fatalf("NewClient: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return pb.NewEventBrokerClient(conn), broker
+	return pb.NewEventBrokerClient(conn)
 }
 
-// waitForSubscribers waits until topic has n consumers. SubscribeTopic
-// registers on the server side after the client call returns, so publishing
-// right away could miss a consumer that isn't registered yet.
-func waitForSubscribers(t *testing.T, broker *Server, topic string, n int) {
+// publish sends reqs on one Publish stream and returns the acks.
+func publish(t *testing.T, client pb.EventBrokerClient, reqs ...*pb.PublishRequest) []*pb.PublishAck {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for broker.subscriberCount(topic) != n {
-		if time.Now().After(deadline) {
-			t.Fatalf("topic %s has %d consumers, want %d", topic, broker.subscriberCount(topic), n)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// recvTimeout bounds a subscription in tests, so a missing event fails the
-// test with DeadlineExceeded instead of hanging until the test binary times out.
-const recvTimeout = 5 * time.Second
-
-// subscribe opens a SubscribeTopic stream for topic and waits until the
-// broker registered it as consumer number n. The stream ends with the test,
-// or after recvTimeout.
-func subscribe(t *testing.T, client pb.EventBrokerClient, broker *Server, topic string, n int) pb.EventBroker_SubscribeTopicClient {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), recvTimeout)
-	t.Cleanup(cancel)
-	sub, err := client.SubscribeTopic(ctx, &pb.SubscribeRequest{Topic: topic})
+	stream, err := client.Publish(t.Context())
 	if err != nil {
-		t.Fatalf("SubscribeTopic(%s): %v", topic, err)
+		t.Fatal(err)
 	}
-	waitForSubscribers(t, broker, topic, n)
+	for _, req := range reqs {
+		if err := stream.Send(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream.CloseSend()
+	var acks []*pb.PublishAck
+	for {
+		ack, err := stream.Recv()
+		if err == io.EOF {
+			return acks
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		acks = append(acks, ack)
+	}
+}
+
+func req(id uint64, shard int32, payload string) *pb.PublishRequest {
+	return &pb.PublishRequest{RequestId: id, Topic: "t", Shard: shard, Payload: []byte(payload)}
+}
+
+func TestDescribeTopic(t *testing.T) {
+	client := newTestClient(t)
+	info, err := client.DescribeTopic(t.Context(), &pb.DescribeTopicRequest{Topic: "t"})
+	if err != nil || info.GetNumShards() != stream.NumShards {
+		t.Errorf("DescribeTopic = %v, %v, want %d shards", info, err, stream.NumShards)
+	}
+	_, err = client.DescribeTopic(t.Context(), &pb.DescribeTopicRequest{Topic: "../x"})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("bad topic err = %v, want InvalidArgument", err)
+	}
+}
+
+func TestPublishAcks(t *testing.T) {
+	client := newTestClient(t)
+	acks := publish(t, client,
+		req(1, 0, `{"n":1}`),
+		req(2, 0, `not json`),
+		req(3, 9, `{"n":3}`),
+		req(4, 0, `{"n":4}`),
+		req(5, 2, `{"n":5}`),
+	)
+	if len(acks) != 5 {
+		t.Fatalf("got %d acks, want 5", len(acks))
+	}
+	want := []struct {
+		code    codes.Code
+		eventID uint64
+	}{
+		{codes.OK, 0},
+		{codes.InvalidArgument, 0},
+		{codes.InvalidArgument, 0}, // shard 9 doesn't exist
+		{codes.OK, 1},
+		{codes.OK, 0}, // first record of shard 2
+	}
+	for i, ack := range acks {
+		if ack.GetRequestId() != uint64(i+1) {
+			t.Errorf("ack %d has request id %d", i, ack.GetRequestId())
+		}
+		if codes.Code(ack.GetErrorCode()) != want[i].code || ack.GetEventId() != want[i].eventID {
+			t.Errorf("ack %d = code %d, id %d, want %v, %d", i, ack.GetErrorCode(), ack.GetEventId(), want[i].code, want[i].eventID)
+		}
+	}
+}
+
+// receive reads n events from sub.
+func receive(t *testing.T, sub pb.EventBroker_SubscribeClient, n int) []*pb.Event {
+	t.Helper()
+	var events []*pb.Event
+	for len(events) < n {
+		batch, err := sub.Recv()
+		if err != nil {
+			t.Fatalf("Recv after %d events: %v", len(events), err)
+		}
+		events = append(events, batch.GetEvents()...)
+	}
+	return events
+}
+
+func subscribe(t *testing.T, client pb.EventBrokerClient, req *pb.SubscribeRequest) pb.EventBroker_SubscribeClient {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	sub, err := client.Subscribe(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return sub
 }
 
-// publish publishes payload on topic and fails the test on error.
-func publish(t *testing.T, client pb.EventBrokerClient, topic, payload string) {
-	t.Helper()
-	if _, err := client.PublishEvent(t.Context(), &pb.EventRequest{Topic: topic, Payload: []byte(payload)}); err != nil {
-		t.Fatalf("PublishEvent(%s, %s): %v", topic, payload, err)
-	}
-}
+// A consumer from offset 1 gets the stored records, then the new ones, with
+// no gap or duplicate.
+func TestSubscribeReplaysThenStreams(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"n":0}`), req(2, 0, `{"n":1}`), req(3, 0, `{"n":2}`))
 
-// recv reads the next event from sub and checks its id and payload.
-func recv(t *testing.T, sub pb.EventBroker_SubscribeTopicClient, wantID, wantPayload string) *pb.EventResponse {
-	t.Helper()
-	event, err := sub.Recv()
-	if err != nil {
-		t.Fatalf("Recv: %v", err)
-	}
-	if event.GetEventId() != wantID || string(event.GetPayload()) != wantPayload {
-		t.Errorf("got event %s %s, want %s %s", event.GetEventId(), event.GetPayload(), wantID, wantPayload)
-	}
-	return event
-}
+	sub := subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, StartId: 1})
+	old := receive(t, sub, 2)
 
-// uniqueTopic returns a topic name no other test or run has used. stream keeps
-// its round-robin position per topic for the whole test binary (including
-// -count reruns), so a fresh topic is the only way to know it starts at shard 0.
-func uniqueTopic() string {
-	return "topic-" + strconv.FormatInt(topicCounter.Add(1), 10)
-}
+	publish(t, client, req(4, 0, `{"n":3}`))
+	live := receive(t, sub, 1)
 
-// topicCounter backs uniqueTopic; it lives for the whole test binary.
-var topicCounter atomic.Int64
-
-func TestPublishEvent(t *testing.T) {
-	dataDir := useTempDataDir(t)
-	topic := uniqueTopic()
-	payload := `{"test":123}`
-
-	resp, err := NewBrokerServer().PublishEvent(context.Background(), &pb.EventRequest{
-		Topic:   topic,
-		Payload: []byte(payload),
-	})
-	if err != nil {
-		t.Fatalf("PublishEvent: %v", err)
-	}
-	if !resp.GetSuccess() {
-		t.Error("PublishEvent Success = false, want true")
-	}
-	// Stored records carry the shard's sequence number (json.Marshal sorts keys).
-	want := `{"seq_n":0,"test":123}`
-	if got := readShard(t, dataDir, topic, "0"); got != want {
-		t.Errorf("shard 0 = %q, want %q", got, want)
-	}
-}
-
-func TestPublishEventOverGRPC(t *testing.T) {
-	dataDir := useTempDataDir(t)
-	client, _ := newTestClient(t)
-	topic := uniqueTopic()
-
-	// Two events on a fresh topic should go to shards 0 and 1 (round robin).
-	payloads := []string{`{"n":1}`, `{"n":2}`}
-	for _, p := range payloads {
-		resp, err := client.PublishEvent(t.Context(), &pb.EventRequest{
-			Topic:   topic,
-			Payload: []byte(p),
-		})
-		if err != nil {
-			t.Fatalf("PublishEvent(%s): %v", p, err)
+	var got []string
+	for i, e := range append(old, live...) {
+		if e.GetEventId() != uint64(i+1) {
+			t.Errorf("event %d has id %d", i, e.GetEventId())
 		}
-		if !resp.GetSuccess() {
-			t.Errorf("PublishEvent(%s) Success = false, want true", p)
-		}
+		got = append(got, string(e.GetPayload()))
 	}
-
-	// Each event is the first record of its shard, so both have seq_n 0.
-	stored := []string{`{"n":1,"seq_n":0}`, `{"n":2,"seq_n":0}`}
-	for i, want := range stored {
-		id := strconv.Itoa(i)
-		if got := readShard(t, dataDir, topic, id); got != want {
-			t.Errorf("shard %s = %q, want %q", id, got, want)
-		}
+	if want := `{"n":1} {"n":2} {"n":3}`; strings.Join(got, " ") != want {
+		t.Errorf("payloads = %v, want %s", got, want)
 	}
 }
 
-func TestPublishEventInvalidPayload(t *testing.T) {
-	dataDir := useTempDataDir(t)
-	client, _ := newTestClient(t)
-	topic := uniqueTopic()
+func TestSubscribeLatest(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"old":true}`))
 
-	_, err := client.PublishEvent(t.Context(), &pb.EventRequest{Topic: topic, Payload: []byte("not json")})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("err = %v, want code InvalidArgument", err)
-	}
-	if _, err := os.Stat(filepath.Join(dataDir, topic, "0")); !os.IsNotExist(err) {
-		t.Errorf("invalid event was written to disk (stat err = %v)", err)
-	}
-}
-
-func TestPublishEventWriteError(t *testing.T) {
-	dataDir := useTempDataDir(t)
-	client, _ := newTestClient(t)
-	// A file where the data directory should be makes every write fail.
-	if err := os.WriteFile(dataDir, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := client.PublishEvent(t.Context(), &pb.EventRequest{Topic: uniqueTopic(), Payload: []byte(`{"a":1}`)})
-	if status.Code(err) != codes.Internal {
-		t.Fatalf("err = %v, want code Internal", err)
-	}
-}
-
-func TestSubscribeTopicReceivesEvents(t *testing.T) {
-	useTempDataDir(t)
-	client, broker := newTestClient(t)
-	topic, otherTopic := uniqueTopic(), uniqueTopic()
-
-	sub1 := subscribe(t, client, broker, topic, 1)
-	sub2 := subscribe(t, client, broker, topic, 2)
-	other := subscribe(t, client, broker, otherTopic, 1)
-
-	before := time.Now().UnixMilli()
-	publish(t, client, topic, `{"n":1}`)
-	publish(t, client, topic, `{"n":2}`)
-	publish(t, client, otherTopic, `{"o":1}`)
-	after := time.Now().UnixMilli()
-
-	// Both consumers of topic get both events, in order, as stored on disk:
-	// round robin puts them on shards 0 and 1, each as seq_n 0.
-	for _, sub := range []pb.EventBroker_SubscribeTopicClient{sub1, sub2} {
-		for _, want := range []struct{ id, payload string }{
-			{topic + "/0/0", `{"n":1,"seq_n":0}`},
-			{topic + "/1/0", `{"n":2,"seq_n":0}`},
-		} {
-			event := recv(t, sub, want.id, want.payload)
-			if ts := event.GetTimestamp(); ts < before || ts > after {
-				t.Errorf("timestamp %d not within [%d, %d]", ts, before, after)
-			}
-		}
-	}
-	// The other topic's consumer only gets its own topic's event: if it had
-	// received topic's events, they would come first.
-	recv(t, other, otherTopic+"/0/0", `{"o":1,"seq_n":0}`)
-}
-
-func TestSubscribeTopicCleanupOnDisconnect(t *testing.T) {
-	useTempDataDir(t)
-	client, broker := newTestClient(t)
-	topic := uniqueTopic()
-
+	sub := subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, Latest: true})
+	// The broker may read the request after a publish, so keep publishing
+	// until the consumer gets something. It must never be the old record.
 	ctx, cancel := context.WithCancel(t.Context())
-	if _, err := client.SubscribeTopic(ctx, &pb.SubscribeRequest{Topic: topic}); err != nil {
-		t.Fatalf("SubscribeTopic: %v", err)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			stream, err := client.Publish(ctx)
+			if err != nil {
+				return
+			}
+			stream.Send(req(2, 0, `{"new":true}`))
+			stream.CloseSend()
+			stream.Recv()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	e := receive(t, sub, 1)[0]
+	if e.GetEventId() == 0 || string(e.GetPayload()) != `{"new":true}` {
+		t.Errorf("got event %d %s, want a new one", e.GetEventId(), e.GetPayload())
 	}
-	waitForSubscribers(t, broker, topic, 1)
-
-	cancel() // the consumer disconnects
-	waitForSubscribers(t, broker, topic, 0)
-
-	// Publishing to a topic with no consumers left still works.
-	publish(t, client, topic, `{"a":1}`)
 }
 
-// A full consumer must not block publishing nor other consumers.
-func TestBroadcastDropsForSlowConsumer(t *testing.T) {
-	broker := NewBrokerServer()
-	slow := broker.addSubscriber("t")
-	fast := broker.addSubscriber("t")
-	for i := 0; i < subscriberBuffer; i++ {
-		slow.events <- &pb.EventResponse{}
+func TestSubscribeMaxBytes(t *testing.T) {
+	client := newTestClient(t)
+	var reqs []*pb.PublishRequest
+	for i := range 10 {
+		reqs = append(reqs, req(uint64(i), 0, `{"pad":"0123456789"}`)) // 20 bytes
 	}
+	publish(t, client, reqs...)
 
-	done := make(chan struct{})
-	go func() {
-		broker.broadcast("t", &pb.EventResponse{EventId: "t/0/0"})
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("broadcast blocked on a full consumer")
-	}
-
-	if len(slow.events) != subscriberBuffer {
-		t.Errorf("slow consumer has %d events, want %d (event dropped)", len(slow.events), subscriberBuffer)
-	}
-	select {
-	case event := <-fast.events:
-		if event.GetEventId() != "t/0/0" {
-			t.Errorf("fast consumer got %q, want t/0/0", event.GetEventId())
+	sub := subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, MaxBytes: 50})
+	total := 0
+	for total < 10 {
+		batch, err := sub.Recv()
+		if err != nil {
+			t.Fatal(err)
 		}
-	default:
-		t.Error("fast consumer did not get the event")
+		if n := len(batch.GetEvents()); n == 0 || n > 2 {
+			t.Errorf("batch has %d events, want 1 or 2 (50 bytes max)", n)
+		}
+		total += len(batch.GetEvents())
+	}
+}
+
+func TestSubscribeErrors(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{}`))
+
+	tests := []struct {
+		req  *pb.SubscribeRequest
+		want codes.Code
+	}{
+		{&pb.SubscribeRequest{Topic: "nope"}, codes.NotFound},
+		{&pb.SubscribeRequest{Topic: "t", Shard: 7}, codes.InvalidArgument},
+		{&pb.SubscribeRequest{Topic: "t", StartId: 5}, codes.OutOfRange},
+	}
+	for _, tt := range tests {
+		_, err := subscribe(t, client, tt.req).Recv()
+		if status.Code(err) != tt.want {
+			t.Errorf("Subscribe(%v) err = %v, want %v", tt.req, err, tt.want)
+		}
 	}
 }
