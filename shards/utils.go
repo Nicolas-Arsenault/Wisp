@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sync"
 )
 
 // Sentinel errors. Callers should match them with errors.Is; the returned
@@ -21,6 +23,15 @@ var (
 	// into exactly one record (bad base64, bad zlib stream, or trailing data).
 	ErrCorruptRecord = errors.New("records: corrupt record data")
 )
+
+type FileLock struct {
+	mu    sync.Mutex //for the lock itself
+	locks map[string]*sync.Mutex
+}
+
+var GlobalFileLock = &FileLock{
+	locks: make(map[string]*sync.Mutex),
+}
 
 // seqNumField is the JSON key DecoratePayload writes the sequence number to.
 const seqNumField = "seq_n"
@@ -145,11 +156,44 @@ func DecompressToRawJSON(compressedBytes []byte) ([]byte, error) {
 	return data, nil
 }
 
+// Getlock returns the mutex for filePath, creating it on first use.
+//
+// The key is the absolute, cleaned path, so different spellings of the same
+// file ("../data/t/0", "data/t/../t/0", "/abs/data/t/0") share one mutex.
+// Symlinks are not resolved: a file reached through a symlink gets its own key.
+//
+// Returns an error only if the absolute path cannot be built (the working
+// directory cannot be read); no lock is created in that case.
+func (l *FileLock) Getlock(filePath string) (*sync.Mutex, error) {
+	key, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("records: lock key for %q: %w", filePath, err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	lock, exists := l.locks[key]
+	if !exists {
+		lock = &sync.Mutex{}
+		l.locks[key] = lock
+	}
+	return lock, nil
+}
+
 // ReadFromFile reads filename and decodes it as a single record.
 // Returns an error wrapping fs.ErrNotExist if the file is missing, or
 // ErrCorruptRecord if its content is not exactly one encoded record
 // (e.g. after AppendToFile was called more than once — see TODO there).
 func ReadFromFile(filename string) ([]byte, error) {
+
+	fileLock, err := GlobalFileLock.Getlock(filename)
+	if err != nil {
+		return nil, err
+	}
+	fileLock.Lock()
+	defer fileLock.Unlock()
+
 	fileBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("records: read %q: %w", filename, err)
@@ -173,6 +217,13 @@ func ReadFromFile(filename string) ([]byte, error) {
 // for contiguous memory.
 func AppendToFile(filename string, content string) (err error) {
 	// Compress first so a failure never leaves the file opened/created for nothing.
+
+	fileLock, err := GlobalFileLock.Getlock(filename)
+	if err != nil {
+		return err
+	}
+	fileLock.Lock()
+	defer fileLock.Unlock()
 	compressed, err := CompressRawJSON([]byte(content))
 	if err != nil {
 		return err
