@@ -1,0 +1,73 @@
+name: Refactor
+description: Improve existing code without changing what it does.
+title: "[Refactor]: "
+labels: ["refactor"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Broker (main.go)
+        - Producer (clients/producer)
+        - Consumer (clients/consumer)
+        - Shards (shards/)
+        - Stream router (stream/)
+        - Proto / gRPC API (proto/)
+        - Tests
+        - CI
+        - Whole codebase
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current code
+      description: What the code looks like today and where (files, lines).
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why refactor?
+      description: What's wrong with it today, e.g. hard to test, duplicated, slow, unclear names.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+
+  - type: dropdown
+    id: behavior
+    attributes:
+      label: Behavior change
+      description: A refactor should not change behavior. If it must, list the changes in "Risks".
+      options:
+        - None, behavior stays the same
+        - Yes, listed under Risks
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks
+      description: What could break, API changes, files on disk, other packages affected.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+        - [ ] go test -race ./... passes with no test changes (or changes explained)
+        - [ ] docs/... updated
+    validations:
+      required: true

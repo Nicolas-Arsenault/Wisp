@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in Wisp doesn't work as documented.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please check the docs in `docs/` first, since some limits are documented on purpose (e.g. no record framing yet).
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Broker (main.go)
+        - Producer (clients/producer)
+        - Consumer (clients/consumer)
+        - Shards (shards/)
+        - Stream router (stream/)
+        - Proto / gRPC API (proto/)
+        - CI
+        - Docs
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you saw, including exact error messages.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of commands or code that shows the problem.
+      placeholder: |
+        1. go run .
+        2. echo '{"a":1}' | go run ./clients/producer -topic t
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Broker and client logs (stderr). Pasted as code automatically.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: "e.g. 3b27179 (git rev-parse --short HEAD)"
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "e.g. macOS 15, Go 1.26.5"
