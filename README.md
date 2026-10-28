@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Nicolas-Arsenault/Wisp/actions/workflows/ci.yml/badge.svg)](https://github.com/Nicolas-Arsenault/Wisp/actions/workflows/ci.yml)
 
-Wisp is a lightweight data streaming platform like AWS kinesis. The goal is for it to be compatible with AI connectors so that you can scan data in real time and fast.
+Wisp is a lightweight data streaming platform like AWS kinesis. The goal is for it to be compatible with AI connectors so that you can scan data in real time and fast and scale easily.
 
 
 ## Packages
