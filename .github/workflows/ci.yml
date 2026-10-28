@@ -1,0 +1,57 @@
+# CI: checks formatting and modules, builds, vets and runs every test
+# (broker, clients, shards, stream) with the race detector.
+# See docs/ci.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # allows a manual run from the Actions tab
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR cancels the run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod # the Go version comes from go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Verify module checksums
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # -count=1 disables the test cache so every run really runs the tests.
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
