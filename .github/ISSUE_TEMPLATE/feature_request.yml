@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose new behavior or a capability Wisp doesn't have yet.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Broker (main.go)
+        - Producer (clients/producer)
+        - Consumer (clients/consumer)
+        - Shards (shards/)
+        - Stream router (stream/)
+        - Proto / gRPC API (proto/)
+        - CI
+        - Docs
+        - New component
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't be done today, or what is hard? Who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How it could work. API, file format or proto changes are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they're worse.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How we'll know it's done. Include tests and docs to update.
+      placeholder: |
+        - [ ] ...
+        - [ ] Tests cover ...
+        - [ ] docs/... updated
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Related code and TODOs
+      description: Files, lines, TODO comments, issues or external references.
