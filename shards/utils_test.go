@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -213,5 +214,44 @@ func TestDecoratePayloadInvalid(t *testing.T) {
 				t.Errorf("seqNum advanced to %d on failure, want 0", seqNum)
 			}
 		})
+	}
+}
+
+func TestGetlockSamePathSharesMutex(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	l := &FileLock{locks: make(map[string]*sync.Mutex)}
+
+	// Different spellings of <dir>/t/0.
+	paths := []string{
+		filepath.Join(dir, "t", "0"),
+		"t/0",
+		"./t/0",
+		"t/../t/0",
+		"t//0",
+	}
+	want, err := l.Getlock(paths[0])
+	if err != nil {
+		t.Fatalf("Getlock(%q): %v", paths[0], err)
+	}
+	for _, p := range paths[1:] {
+		got, err := l.Getlock(p)
+		if err != nil {
+			t.Fatalf("Getlock(%q): %v", p, err)
+		}
+		if got != want {
+			t.Errorf("Getlock(%q) returned a different mutex than Getlock(%q)", p, paths[0])
+		}
+	}
+
+	other, err := l.Getlock("t/1")
+	if err != nil {
+		t.Fatalf("Getlock(t/1): %v", err)
+	}
+	if other == want {
+		t.Error("Getlock(t/1) returned the same mutex as t/0")
+	}
+	if len(l.locks) != 2 {
+		t.Errorf("len(locks) = %d, want 2", len(l.locks))
 	}
 }
