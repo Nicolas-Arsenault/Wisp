@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -235,6 +236,115 @@ func TestSubscribeErrors(t *testing.T) {
 		_, err := subscribe(t, client, tt.req).Recv()
 		if status.Code(err) != tt.want {
 			t.Errorf("Subscribe(%v) err = %v, want %v", tt.req, err, tt.want)
+		}
+	}
+}
+
+// join opens a Join stream for consumer id on topic t. cancel leaves.
+func join(t *testing.T, client pb.EventBrokerClient, id string) (pb.EventBroker_JoinClient, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	stream, err := client.Join(ctx, &pb.JoinRequest{Topic: "t", ConsumerId: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stream, cancel
+}
+
+// expectShards reads the next assignment and checks its shards.
+func expectShards(t *testing.T, stream pb.EventBroker_JoinClient, want string) *pb.Assignment {
+	t.Helper()
+	a, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if got := fmt.Sprint(a.GetShards()); got != want {
+		t.Errorf("shards = %s, want %s", got, want)
+	}
+	return a
+}
+
+// The flow from the docs: A alone gets every shard; when B joins, both get
+// their new split; when B leaves, A gets every shard again.
+func TestJoinRebalances(t *testing.T) {
+	client := newTestClient(t)
+
+	a, _ := join(t, client, "a")
+	first := expectShards(t, a, "[0 1 2 3 4]")
+	if first.GetTopic() != "t" {
+		t.Errorf("topic = %q, want t", first.GetTopic())
+	}
+
+	b, leaveB := join(t, client, "b")
+	second := expectShards(t, a, "[0 2 4]")
+	expectShards(t, b, "[1 3]")
+	if second.GetGeneration() <= first.GetGeneration() {
+		t.Errorf("generation %d after %d, want it to increase", second.GetGeneration(), first.GetGeneration())
+	}
+
+	leaveB()
+	expectShards(t, a, "[0 1 2 3 4]")
+}
+
+func TestJoinThreeConsumers(t *testing.T) {
+	client := newTestClient(t)
+	a, _ := join(t, client, "a")
+	expectShards(t, a, "[0 1 2 3 4]")
+	b, _ := join(t, client, "b")
+	expectShards(t, a, "[0 2 4]")
+	expectShards(t, b, "[1 3]")
+
+	c, _ := join(t, client, "c")
+	expectShards(t, a, "[0 3]")
+	expectShards(t, b, "[1 4]")
+	expectShards(t, c, "[2]")
+}
+
+// Every shard has exactly one owner, whatever the number of consumers.
+func TestRebalanceCoversEveryShard(t *testing.T) {
+	s := NewBrokerServer(nil)
+	for n := 1; n <= 7; n++ {
+		g := &group{numShards: 5}
+		for i := range n {
+			g.members = append(g.members, &member{id: fmt.Sprint(i), updates: make(chan *pb.Assignment, 1)})
+		}
+		s.rebalance("t", g)
+
+		owners := make(map[int32]int)
+		for _, m := range g.members {
+			for _, shard := range (<-m.updates).GetShards() {
+				owners[shard]++
+			}
+		}
+		for shard := range int32(5) {
+			if owners[shard] != 1 {
+				t.Errorf("%d consumers: shard %d has %d owners, want 1", n, shard, owners[shard])
+			}
+		}
+	}
+}
+
+func TestJoinErrors(t *testing.T) {
+	client := newTestClient(t)
+	a, _ := join(t, client, "a")
+	expectShards(t, a, "[0 1 2 3 4]")
+
+	tests := []struct {
+		req  *pb.JoinRequest
+		want codes.Code
+	}{
+		{&pb.JoinRequest{Topic: "t", ConsumerId: "a"}, codes.AlreadyExists},
+		{&pb.JoinRequest{Topic: "t"}, codes.InvalidArgument},
+		{&pb.JoinRequest{Topic: "../x", ConsumerId: "b"}, codes.InvalidArgument},
+	}
+	for _, tt := range tests {
+		stream, err := client.Join(t.Context(), tt.req)
+		if err == nil {
+			_, err = stream.Recv()
+		}
+		if status.Code(err) != tt.want {
+			t.Errorf("Join(%v) err = %v, want %v", tt.req, err, tt.want)
 		}
 	}
 }

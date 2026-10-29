@@ -9,13 +9,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 	pb "wisp/proto"
 	"wisp/shards"
 	"wisp/stream"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
@@ -33,10 +36,13 @@ var errBadShard = errors.New("shard out of range")
 type Server struct {
 	pb.UnimplementedEventBrokerServer
 	topics *stream.Registry
+
+	mu     sync.Mutex        // guards groups
+	groups map[string]*group // consumers of each topic (see groups.go)
 }
 
 func NewBrokerServer(topics *stream.Registry) *Server {
-	return &Server{topics: topics}
+	return &Server{topics: topics, groups: make(map[string]*group)}
 }
 
 // DescribeTopic returns the topic's shard count, creating the topic if needed.
@@ -230,7 +236,12 @@ func run() error {
 	}
 
 	// WaitForHandlers: Stop waits until no handler can still read a shard.
-	grpcServer := grpc.NewServer(grpc.WaitForHandlers(true))
+	// Keepalive pings idle clients, so a consumer whose connection died
+	// without closing leaves its group after about 15 s.
+	grpcServer := grpc.NewServer(
+		grpc.WaitForHandlers(true),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 10 * time.Second, Timeout: 5 * time.Second}),
+	)
 	pb.RegisterEventBrokerServer(grpcServer, NewBrokerServer(topics))
 	go func() {
 		<-ctx.Done()

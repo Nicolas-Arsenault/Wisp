@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -18,22 +19,74 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-// fakeBroker answers Subscribe with the subscribe func.
+// fakeBroker sends the assignments put on assign to the consumer that
+// joins. Subscribe sends one event of the shard asked for (unless
+// subscribeErr is set), then waits until the consumer cancels; closed gets
+// the shard number when it does.
 type fakeBroker struct {
 	pb.UnimplementedEventBrokerServer
-	subscribe func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error
+	assign       chan *pb.Assignment
+	joinErr      error
+	subscribeErr error
+	closed       chan int32
+
+	mu         sync.Mutex
+	join       *pb.JoinRequest
+	subscribes []*pb.SubscribeRequest
+}
+
+func newFakeBroker() *fakeBroker {
+	return &fakeBroker{assign: make(chan *pb.Assignment, 10), closed: make(chan int32, 10)}
+}
+
+func (f *fakeBroker) Join(req *pb.JoinRequest, stream pb.EventBroker_JoinServer) error {
+	f.mu.Lock()
+	f.join = req
+	f.mu.Unlock()
+	if f.joinErr != nil {
+		return f.joinErr
+	}
+	for {
+		select {
+		case a, ok := <-f.assign:
+			if !ok {
+				return nil // ends the stream
+			}
+			if err := stream.Send(a); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
 }
 
 func (f *fakeBroker) Subscribe(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
-	return f.subscribe(req, stream)
+	f.mu.Lock()
+	f.subscribes = append(f.subscribes, req)
+	f.mu.Unlock()
+	if f.subscribeErr != nil {
+		return f.subscribeErr
+	}
+	event := &pb.Event{EventId: 0, Timestamp: testTimestamp, Payload: fmt.Appendf(nil, `{"shard":%d}`, req.GetShard())}
+	if err := stream.Send(&pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard(), Events: []*pb.Event{event}}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	f.closed <- req.GetShard()
+	return stream.Context().Err()
 }
 
-// batch builds a batch of shard 0 of topic t with one event.
-func batch(id uint64, payload string) *pb.EventBatch {
-	return &pb.EventBatch{Topic: "t", Shard: 0, Events: []*pb.Event{{EventId: id, Payload: []byte(payload)}}}
+// subscribedShards returns the shard of each Subscribe call, in order.
+func (f *fakeBroker) subscribedShards() []int32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var shards []int32
+	for _, req := range f.subscribes {
+		shards = append(shards, req.GetShard())
+	}
+	return shards
 }
-
-var testOpts = options{topic: "t", shard: 0}
 
 // newClient serves broker on an in-memory listener and returns a client for it.
 func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
@@ -57,8 +110,52 @@ func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
 	return pb.NewEventBrokerClient(conn)
 }
 
+// lineWriter sends every line written to it on lines.
+type lineWriter struct{ lines chan string }
+
+func (w lineWriter) Write(p []byte) (int, error) {
+	w.lines <- strings.TrimSuffix(string(p), "\n")
+	return len(p), nil
+}
+
+// failingWriter fails every write, like a closed stdout pipe.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+type result struct {
+	printed int
+	err     error
+}
+
+// start runs the consumer in the background.
+func start(t *testing.T, ctx context.Context, broker *fakeBroker, opts options, out io.Writer) chan result {
+	t.Helper()
+	done := make(chan result, 1)
+	client := newClient(t, broker)
+	go func() {
+		printed, err := run(ctx, client, opts, out)
+		done <- result{printed, err}
+	}()
+	return done
+}
+
+func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
 // 2026-10-27T21:40:00.123Z in Unix milliseconds.
 const testTimestamp = 1793137200123
+
+var testOpts = options{topic: "t", id: "a"}
 
 func TestFormatEvent(t *testing.T) {
 	got := formatEvent(&pb.EventBatch{Topic: "s", Shard: 2}, &pb.Event{EventId: 7, Timestamp: testTimestamp, Payload: []byte(`{"a":1}`)})
@@ -68,125 +165,110 @@ func TestFormatEvent(t *testing.T) {
 	}
 }
 
-// The broker sends two batches (3 events), then ends the stream: all are
-// printed, the request carries the options, and run returns cleanly.
-func TestRunPrintsEvents(t *testing.T) {
-	var got *pb.SubscribeRequest
-	broker := &fakeBroker{subscribe: func(req *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
-		got = req
-		batches := []*pb.EventBatch{
-			{Topic: "sensors", Shard: 3, Events: []*pb.Event{
-				{EventId: 5, Timestamp: testTimestamp, Payload: []byte(`{"n":1}`)},
-				{EventId: 6, Timestamp: testTimestamp, Payload: []byte(`{"n":2}`)},
-			}},
-			{Topic: "sensors", Shard: 3, Events: []*pb.Event{{EventId: 7, Timestamp: testTimestamp, Payload: []byte(`{"n":3}`)}}},
-		}
-		for _, b := range batches {
-			if err := stream.Send(b); err != nil {
-				return err
-			}
-		}
-		return nil // ends the stream: the client sees io.EOF
-	}}
-
-	var out bytes.Buffer
-	opts := options{topic: "sensors", shard: 3, offset: 5, maxBytes: 100}
-	received, err := run(t.Context(), newClient(t, broker), opts, &out)
-	if err != nil || received != 3 {
-		t.Fatalf("run = %d, %v, want 3, nil", received, err)
-	}
-	if got.GetTopic() != "sensors" || got.GetShard() != 3 || got.GetStartId() != 5 || got.GetMaxBytes() != 100 || got.GetLatest() {
-		t.Errorf("request = %v", got)
-	}
-	want := "sensors/3/5\t2026-10-27T21:40:00.123Z\t{\"n\":1}\n" +
-		"sensors/3/6\t2026-10-27T21:40:00.123Z\t{\"n\":2}\n" +
-		"sensors/3/7\t2026-10-27T21:40:00.123Z\t{\"n\":3}\n"
-	if out.String() != want {
-		t.Errorf("output =\n%s\nwant\n%s", out.String(), want)
-	}
-}
-
-// signalWriter collects output and signals each write on wrote.
-type signalWriter struct {
-	mu    sync.Mutex
-	buf   bytes.Buffer
-	wrote chan struct{}
-}
-
-func (w *signalWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	n, err := w.buf.Write(p)
-	w.wrote <- struct{}{}
-	return n, err
-}
-
-// Cancelling ctx (Ctrl+C) is a normal shutdown: run returns nil.
-func TestRunStopsCleanlyOnCancel(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
-		if err := stream.Send(batch(0, `{}`)); err != nil {
-			return err
-		}
-		<-stream.Context().Done() // stay subscribed, like the real broker
-		return stream.Context().Err()
-	}}
+// The consumer joins, reads the shards it's assigned, stops reading a shard
+// that is taken away, and exits cleanly on Ctrl+C.
+func TestRunFollowsAssignments(t *testing.T) {
+	broker := newFakeBroker()
+	out := lineWriter{lines: make(chan string, 10)}
 	ctx, cancel := context.WithCancel(t.Context())
-	out := &signalWriter{wrote: make(chan struct{}, 1)}
+	opts := options{topic: "t", id: "a", offset: 5, maxBytes: 100}
+	done := start(t, ctx, broker, opts, out)
 
-	type result struct {
-		received int
-		err      error
+	broker.assign <- &pb.Assignment{Topic: "t", Generation: 1, Shards: []int32{0, 2}}
+	got := map[string]bool{}
+	for range 2 {
+		got[waitFor(t, out.lines, "event")] = true
 	}
-	done := make(chan result, 1)
-	go func() {
-		received, err := run(ctx, newClient(t, broker), testOpts, out)
-		done <- result{received, err}
-	}()
+	for _, shard := range []int{0, 2} {
+		line := fmt.Sprintf("t/%d/0\t2026-10-27T21:40:00.123Z\t{\"shard\":%d}", shard, shard)
+		if !got[line] {
+			t.Errorf("missing line %q, got %v", line, got)
+		}
+	}
 
-	select {
-	case <-out.wrote:
-	case <-time.After(5 * time.Second):
-		t.Fatal("event was never printed")
+	broker.mu.Lock()
+	if broker.join.GetTopic() != "t" || broker.join.GetConsumerId() != "a" {
+		t.Errorf("join request = %v", broker.join)
+	}
+	for _, req := range broker.subscribes {
+		if req.GetStartId() != 5 || req.GetMaxBytes() != 100 || req.GetLatest() {
+			t.Errorf("subscribe request = %v, want the options", req)
+		}
+	}
+	broker.mu.Unlock()
+
+	// Shard 0 is taken away: its subscription is cancelled.
+	broker.assign <- &pb.Assignment{Topic: "t", Generation: 2, Shards: []int32{2}}
+	if shard := waitFor(t, broker.closed, "shard 0 to be closed"); shard != 0 {
+		t.Errorf("closed shard %d, want 0", shard)
+	}
+
+	cancel()
+	r := waitFor(t, done, "run to return")
+	if r.err != nil || r.printed != 2 {
+		t.Errorf("run = %d, %v, want 2, nil", r.printed, r.err)
+	}
+}
+
+// A shard that stays assigned isn't subscribed again; a new one is.
+func TestRunSubscribesOnlyNewShards(t *testing.T) {
+	broker := newFakeBroker()
+	out := lineWriter{lines: make(chan string, 10)}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := start(t, ctx, broker, testOpts, out)
+
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{0}}
+	waitFor(t, out.lines, "event of shard 0")
+	broker.assign <- &pb.Assignment{Generation: 2, Shards: []int32{0, 1}}
+	waitFor(t, out.lines, "event of shard 1")
+
+	if got := fmt.Sprint(broker.subscribedShards()); got != "[0 1]" {
+		t.Errorf("subscribed to %s, want [0 1]", got)
 	}
 	cancel()
+	waitFor(t, done, "run to return")
+}
 
-	select {
-	case r := <-done:
-		if r.err != nil || r.received != 1 {
-			t.Errorf("run = %d, %v, want 1, nil", r.received, r.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("run did not stop after cancel")
+// The broker ending the Join stream is a clean exit.
+func TestRunEndsWithJoinStream(t *testing.T) {
+	broker := newFakeBroker()
+	done := start(t, t.Context(), broker, testOpts, lineWriter{lines: make(chan string, 10)})
+	close(broker.assign)
+
+	if r := waitFor(t, done, "run to return"); r.err != nil {
+		t.Errorf("run = %v, want nil", r.err)
 	}
 }
 
-// A broker error is returned, not swallowed.
-func TestRunReturnsBrokerError(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(*pb.SubscribeRequest, pb.EventBroker_SubscribeServer) error {
-		return status.Error(codes.Unavailable, "broker shutting down")
-	}}
-
-	received, err := run(t.Context(), newClient(t, broker), testOpts, &bytes.Buffer{})
-	if status.Code(err) != codes.Unavailable {
-		t.Errorf("err = %v, want Unavailable", err)
-	}
-	if received != 0 {
-		t.Errorf("received = %d, want 0", received)
+func TestRunReturnsJoinError(t *testing.T) {
+	broker := newFakeBroker()
+	broker.joinErr = status.Error(codes.AlreadyExists, "consumer already joined")
+	r := waitFor(t, start(t, t.Context(), broker, testOpts, failingWriter{}), "run to return")
+	if status.Code(errors.Unwrap(r.err)) != codes.AlreadyExists {
+		t.Errorf("err = %v, want AlreadyExists", r.err)
 	}
 }
 
-// failingWriter fails every write, like a closed stdout pipe.
-type failingWriter struct{}
+// A shard that can't be read stops the consumer.
+func TestRunReturnsShardError(t *testing.T) {
+	broker := newFakeBroker()
+	broker.subscribeErr = status.Error(codes.OutOfRange, "start_id is after the end of the shard")
+	done := start(t, t.Context(), broker, testOpts, failingWriter{})
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{3}}
 
-func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+	r := waitFor(t, done, "run to return")
+	if r.err == nil || !strings.Contains(r.err.Error(), "t/3") || !strings.Contains(r.err.Error(), "OutOfRange") {
+		t.Errorf("err = %v, want OutOfRange for t/3", r.err)
+	}
+}
 
 func TestRunReturnsWriteError(t *testing.T) {
-	broker := &fakeBroker{subscribe: func(_ *pb.SubscribeRequest, stream pb.EventBroker_SubscribeServer) error {
-		return stream.Send(batch(0, `{}`))
-	}}
+	broker := newFakeBroker()
+	done := start(t, t.Context(), broker, testOpts, failingWriter{})
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{0}}
 
-	_, err := run(t.Context(), newClient(t, broker), testOpts, failingWriter{})
-	if err == nil || !strings.Contains(err.Error(), "broken pipe") {
-		t.Errorf("err = %v, want the write error", err)
+	r := waitFor(t, done, "run to return")
+	if r.err == nil || !strings.Contains(r.err.Error(), "broken pipe") {
+		t.Errorf("err = %v, want the write error", r.err)
 	}
 }

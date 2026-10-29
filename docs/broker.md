@@ -44,6 +44,30 @@ Streams **one shard**.
   | `OUT_OF_RANGE` | `start_id` after the end of the shard |
   | `UNAVAILABLE` | the broker is shutting down |
 
+### `Join(topic, consumer_id)` (server stream)
+
+Consumers don't choose their shards: they join the topic, and the broker splits the shards between them (code: `groups.go`).
+
+1. **Join:** consumer A joins topic `t`. The broker registers it and sends `Assignment{shards: [0 1 2 3 4]}`.
+2. **Another consumer joins:** B joins. The broker splits the shards again and sends an update to both: A gets `[0 2 4]` and B gets `[1 3]`.
+3. **A consumer leaves:** when B leaves, A gets `[0 1 2 3 4]` again.
+
+- **Split:** consumers are kept in join order, and shard `i` goes to consumer `i % n`.
+- **Generation:** each assignment has a `generation` that increases with every rebalance of the topic.
+- **Membership:** a consumer is a member while its `Join` stream is open.
+  - It leaves when the stream ends (Ctrl+C, closed connection).
+  - A connection that dies silently is detected by gRPC keepalive pings (every 10 s, 5 s timeout).
+- **Reading:** the consumer reads each assigned shard with `Subscribe`.
+- **Errors:**
+
+  | Error | Cause |
+  |---|---|
+  | `INVALID_ARGUMENT` | empty `consumer_id` or bad topic name |
+  | `ALREADY_EXISTS` | the id is already in the topic |
+
+  A topic that doesn't exist is created.
+- **Limit:** offsets aren't stored. When a shard moves to another consumer, that consumer starts at its own `-offset` / `-latest`, not where the previous owner stopped. It can re-read records.
+
 ### Shutdown
 
 On Ctrl+C or SIGTERM, the broker:
@@ -65,5 +89,6 @@ These run the real broker over an in-memory connection, with its data in a temp 
 
 - **Publish:** acks and error acks.
 - **Subscribe:** replay then live, `latest`, `max_bytes` batching, and errors.
+- **Join:** the A/B/C rebalance flow, every shard having exactly one owner, and errors.
 
 Run with `go test -race .`.

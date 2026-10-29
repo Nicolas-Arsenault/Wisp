@@ -19,25 +19,27 @@ go run ./clients/producer -topic sensors -key-field device < events.jsonl
 
 ## Consumer (`clients/consumer`)
 
-Reads **one shard**: first the stored events from `-offset`, then new ones, until Ctrl+C.
+Joins a topic and prints the events of the shards the broker assigns to it, until Ctrl+C. When other consumers join or leave, it follows its new assignment: it starts reading new shards and stops reading the ones taken away.
 
 ```sh
-go run ./clients/consumer -topic sensors -shard 0              # from the start
-go run ./clients/consumer -topic sensors -shard 0 -offset 42   # from event 42
-go run ./clients/consumer -topic sensors -shard 0 -latest      # only new events
+go run ./clients/consumer -topic sensors -id a           # terminal 1: gets shards [0 1 2 3 4]
+go run ./clients/consumer -topic sensors -id b           # terminal 2: a now gets [0 2 4], b gets [1 3]
+go run ./clients/consumer -topic sensors -id c -latest   # only new events
 ```
 
-Output, tab separated, on stdout (logs go to stderr):
+Output, tab separated, on stdout (logs go to stderr, including each new assignment):
 
 ```
 <topic>/<shard>/<event id>	<timestamp, RFC 3339 UTC, ms>	<payload>
 sensors/0/0	2026-10-28T04:25:08.026Z	{"dev":"a","n":1}
 ```
 
+- **`-id`:** must be unique in the topic. Defaults to `<hostname>-<pid>`.
+- **`-offset` / `-latest`:** where to start reading each newly assigned shard (default: offset 0).
 - **`-max-bytes`:** caps each batch the broker sends (0 = broker default, 1 MiB).
 - **Exit 0:** on Ctrl+C, or when the broker ends the stream.
-- **Exit 1:** for errors, e.g. an unknown topic or an offset after the end of the shard.
+- **Exit 1:** for errors, e.g. a duplicate id, or an offset after the end of a shard.
 
 ## Tests
 
-`clients/*/main_test.go` run `run` against a fake broker over an in-memory `bufconn` connection. Run with `go test -race ./clients/...`.
+`clients/*/main_test.go` run `run` against a fake broker over an in-memory `bufconn` connection. The consumer tests check that it reads the assigned shards, stops reading a shard that is taken away, doesn't resubscribe to shards it keeps, and returns join, shard and write errors. Run with `go test -race ./clients/...`.

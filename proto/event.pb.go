@@ -469,6 +469,121 @@ func (x *EventBatch) GetEvents() []*Event {
 	return nil
 }
 
+type JoinRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	// consumer_id must be unique among the topic's consumers.
+	ConsumerId    string `protobuf:"bytes,2,opt,name=consumer_id,json=consumerId,proto3" json:"consumer_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinRequest) Reset() {
+	*x = JoinRequest{}
+	mi := &file_proto_event_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinRequest) ProtoMessage() {}
+
+func (x *JoinRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinRequest.ProtoReflect.Descriptor instead.
+func (*JoinRequest) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *JoinRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *JoinRequest) GetConsumerId() string {
+	if x != nil {
+		return x.ConsumerId
+	}
+	return ""
+}
+
+type Assignment struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	// generation increases with each rebalance of the topic.
+	Generation uint64 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
+	// shards this consumer should read now.
+	Shards        []int32 `protobuf:"varint,3,rep,packed,name=shards,proto3" json:"shards,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Assignment) Reset() {
+	*x = Assignment{}
+	mi := &file_proto_event_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Assignment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Assignment) ProtoMessage() {}
+
+func (x *Assignment) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Assignment.ProtoReflect.Descriptor instead.
+func (*Assignment) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *Assignment) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *Assignment) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *Assignment) GetShards() []int32 {
+	if x != nil {
+		return x.Shards
+	}
+	return nil
+}
+
 var File_proto_event_proto protoreflect.FileDescriptor
 
 const file_proto_event_proto_rawDesc = "" +
@@ -509,11 +624,23 @@ const file_proto_event_proto_rawDesc = "" +
 	"EventBatch\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12#\n" +
-	"\x06events\x18\x03 \x03(\v2\v.wisp.EventR\x06events2\xbb\x01\n" +
+	"\x06events\x18\x03 \x03(\v2\v.wisp.EventR\x06events\"D\n" +
+	"\vJoinRequest\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1f\n" +
+	"\vconsumer_id\x18\x02 \x01(\tR\n" +
+	"consumerId\"Z\n" +
+	"\n" +
+	"Assignment\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x02 \x01(\x04R\n" +
+	"generation\x12\x16\n" +
+	"\x06shards\x18\x03 \x03(\x05R\x06shards2\xea\x01\n" +
 	"\vEventBroker\x12<\n" +
 	"\rDescribeTopic\x12\x1a.wisp.DescribeTopicRequest\x1a\x0f.wisp.TopicInfo\x125\n" +
 	"\aPublish\x12\x14.wisp.PublishRequest\x1a\x10.wisp.PublishAck(\x010\x01\x127\n" +
-	"\tSubscribe\x12\x16.wisp.SubscribeRequest\x1a\x10.wisp.EventBatch0\x01B\fZ\n" +
+	"\tSubscribe\x12\x16.wisp.SubscribeRequest\x1a\x10.wisp.EventBatch0\x01\x12-\n" +
+	"\x04Join\x12\x11.wisp.JoinRequest\x1a\x10.wisp.Assignment0\x01B\fZ\n" +
 	"wisp/protob\x06proto3"
 
 var (
@@ -528,7 +655,7 @@ func file_proto_event_proto_rawDescGZIP() []byte {
 	return file_proto_event_proto_rawDescData
 }
 
-var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_proto_event_proto_goTypes = []any{
 	(*DescribeTopicRequest)(nil), // 0: wisp.DescribeTopicRequest
 	(*TopicInfo)(nil),            // 1: wisp.TopicInfo
@@ -537,17 +664,21 @@ var file_proto_event_proto_goTypes = []any{
 	(*SubscribeRequest)(nil),     // 4: wisp.SubscribeRequest
 	(*Event)(nil),                // 5: wisp.Event
 	(*EventBatch)(nil),           // 6: wisp.EventBatch
+	(*JoinRequest)(nil),          // 7: wisp.JoinRequest
+	(*Assignment)(nil),           // 8: wisp.Assignment
 }
 var file_proto_event_proto_depIdxs = []int32{
 	5, // 0: wisp.EventBatch.events:type_name -> wisp.Event
 	0, // 1: wisp.EventBroker.DescribeTopic:input_type -> wisp.DescribeTopicRequest
 	2, // 2: wisp.EventBroker.Publish:input_type -> wisp.PublishRequest
 	4, // 3: wisp.EventBroker.Subscribe:input_type -> wisp.SubscribeRequest
-	1, // 4: wisp.EventBroker.DescribeTopic:output_type -> wisp.TopicInfo
-	3, // 5: wisp.EventBroker.Publish:output_type -> wisp.PublishAck
-	6, // 6: wisp.EventBroker.Subscribe:output_type -> wisp.EventBatch
-	4, // [4:7] is the sub-list for method output_type
-	1, // [1:4] is the sub-list for method input_type
+	7, // 4: wisp.EventBroker.Join:input_type -> wisp.JoinRequest
+	1, // 5: wisp.EventBroker.DescribeTopic:output_type -> wisp.TopicInfo
+	3, // 6: wisp.EventBroker.Publish:output_type -> wisp.PublishAck
+	6, // 7: wisp.EventBroker.Subscribe:output_type -> wisp.EventBatch
+	8, // 8: wisp.EventBroker.Join:output_type -> wisp.Assignment
+	5, // [5:9] is the sub-list for method output_type
+	1, // [1:5] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -564,7 +695,7 @@ func file_proto_event_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_event_proto_rawDesc), len(file_proto_event_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

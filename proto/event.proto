@@ -14,6 +14,10 @@ service EventBroker {
   // Subscribe streams one shard from start_id (or from its end if latest is
   // set): first every stored record, then new records as they are written.
   rpc Subscribe (SubscribeRequest) returns (stream EventBatch);
+  // Join registers a consumer of a topic for as long as the stream is open.
+  // The broker splits the topic's shards between its consumers and sends a
+  // new Assignment each time a consumer joins or leaves.
+  rpc Join (JoinRequest) returns (stream Assignment);
 }
 
 message DescribeTopicRequest {
@@ -70,4 +74,18 @@ message EventBatch {
   string topic = 1;
   int32 shard = 2;
   repeated Event events = 3;
+}
+
+message JoinRequest {
+  string topic = 1;
+  // consumer_id must be unique among the topic's consumers.
+  string consumer_id = 2;
+}
+
+message Assignment {
+  string topic = 1;
+  // generation increases with each rebalance of the topic.
+  uint64 generation = 2;
+  // shards this consumer should read now.
+  repeated int32 shards = 3;
 }
