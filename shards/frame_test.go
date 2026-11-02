@@ -69,38 +69,38 @@ func TestDecompressRejectsGarbage(t *testing.T) {
 
 func TestFrameRoundTrip(t *testing.T) {
 	var buf []byte
-	buf = appendFrame(buf, 7, 1234, []byte("first"))
-	buf = appendFrame(buf, 8, 5678, []byte{})
+	buf = appendFrame(buf, frame{id: 7, timestamp: 1234, producer: 9, sequence: 3, body: []byte("first")})
+	buf = appendFrame(buf, frame{id: 8, timestamp: 5678, body: []byte{}})
 	if int64(len(buf)) != frameSize(5)+frameSize(0) {
 		t.Fatalf("frames are %d bytes, want %d", len(buf), frameSize(5)+frameSize(0))
 	}
 
 	r := bufio.NewReader(bytes.NewReader(buf))
-	id, ts, body, err := readFrame(r)
-	if err != nil || id != 7 || ts != 1234 || string(body) != "first" {
-		t.Errorf("frame 1 = %d, %d, %q, %v", id, ts, body, err)
+	f, err := readFrame(r)
+	if err != nil || f.id != 7 || f.timestamp != 1234 || f.producer != 9 || f.sequence != 3 || string(f.body) != "first" {
+		t.Errorf("frame 1 = %+v, %v", f, err)
 	}
-	id, ts, body, err = readFrame(r)
-	if err != nil || id != 8 || ts != 5678 || len(body) != 0 {
-		t.Errorf("frame 2 = %d, %d, %q, %v", id, ts, body, err)
+	f, err = readFrame(r)
+	if err != nil || f.id != 8 || f.timestamp != 5678 || f.producer != 0 || len(f.body) != 0 {
+		t.Errorf("frame 2 = %+v, %v", f, err)
 	}
-	if _, _, _, err := readFrame(r); err != io.EOF {
+	if _, err := readFrame(r); err != io.EOF {
 		t.Errorf("after last frame err = %v, want io.EOF", err)
 	}
 }
 
 func TestReadFrameDetectsCorruption(t *testing.T) {
-	frame := appendFrame(nil, 1, 2, []byte("payload"))
+	stored := appendFrame(nil, frame{id: 1, timestamp: 2, body: []byte("payload")})
 
 	tests := map[string][]byte{
-		"torn header":  frame[:10],
-		"torn body":    frame[:len(frame)-2],
-		"flipped body": append(append([]byte{}, frame[:len(frame)-1]...), frame[len(frame)-1]^0xff),
-		"flipped id":   append(append(append([]byte{}, frame[:5]...), frame[5]^0x01), frame[6:]...),
-		"huge length":  append([]byte{0xff, 0xff, 0xff, 0xff}, frame[4:]...),
+		"torn header":  stored[:10],
+		"torn body":    stored[:len(stored)-2],
+		"flipped body": append(append([]byte{}, stored[:len(stored)-1]...), stored[len(stored)-1]^0xff),
+		"flipped id":   append(append(append([]byte{}, stored[:5]...), stored[5]^0x01), stored[6:]...),
+		"huge length":  append([]byte{0xff, 0xff, 0xff, 0xff}, stored[4:]...),
 	}
 	for name, data := range tests {
-		_, _, _, err := readFrame(bufio.NewReader(bytes.NewReader(data)))
+		_, err := readFrame(bufio.NewReader(bytes.NewReader(data)))
 		if !errors.Is(err, ErrCorruptRecord) {
 			t.Errorf("%s: err = %v, want ErrCorruptRecord", name, err)
 		}

@@ -14,4 +14,6 @@ Code: `stream/`.
 - **Locking:** a mutex only guards the topic map (topic creation). Writing and reading shards takes no lock.
 - **Close:** `Close()` closes every shard; records still queued are stored first.
 
-There is no round robin: the producer chooses the shard (see [records.md](records.md)).
+- **Offsets:** `SaveOffset` and `LoadOffset` keep each consumer group's position in `<dataDir>/<topic>/groups/<group>/<shard>.offset` (see [broker.md](broker.md)). Group names follow the same rule as topic names (`ErrInvalidGroup`).
+
+The broker doesn't choose shards: the producer does (see [records.md](records.md)).

@@ -22,6 +22,8 @@ const (
 	EventBroker_DescribeTopic_FullMethodName = "/wisp.EventBroker/DescribeTopic"
 	EventBroker_Publish_FullMethodName       = "/wisp.EventBroker/Publish"
 	EventBroker_Subscribe_FullMethodName     = "/wisp.EventBroker/Subscribe"
+	EventBroker_Join_FullMethodName          = "/wisp.EventBroker/Join"
+	EventBroker_Commit_FullMethodName        = "/wisp.EventBroker/Commit"
 )
 
 // EventBrokerClient is the client API for EventBroker service.
@@ -38,6 +40,13 @@ type EventBrokerClient interface {
 	// Subscribe streams one shard from start_id (or from its end if latest is
 	// set): first every stored record, then new records as they are written.
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventBatch], error)
+	// Join registers a consumer in a group of a topic for as long as the stream
+	// is open. The broker splits the topic's shards between the group's
+	// consumers and sends a new Assignment each time a consumer joins or leaves.
+	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Assignment], error)
+	// Commit stores where a group has read a shard up to. Only the shard's
+	// current owner can commit: any other caller gets FAILED_PRECONDITION.
+	Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error)
 }
 
 type eventBrokerClient struct {
@@ -90,6 +99,35 @@ func (c *eventBrokerClient) Subscribe(ctx context.Context, in *SubscribeRequest,
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type EventBroker_SubscribeClient = grpc.ServerStreamingClient[EventBatch]
 
+func (c *eventBrokerClient) Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Assignment], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &EventBroker_ServiceDesc.Streams[2], EventBroker_Join_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[JoinRequest, Assignment]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_JoinClient = grpc.ServerStreamingClient[Assignment]
+
+func (c *eventBrokerClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitResponse)
+	err := c.cc.Invoke(ctx, EventBroker_Commit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EventBrokerServer is the server API for EventBroker service.
 // All implementations must embed UnimplementedEventBrokerServer
 // for forward compatibility.
@@ -104,6 +142,13 @@ type EventBrokerServer interface {
 	// Subscribe streams one shard from start_id (or from its end if latest is
 	// set): first every stored record, then new records as they are written.
 	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[EventBatch]) error
+	// Join registers a consumer in a group of a topic for as long as the stream
+	// is open. The broker splits the topic's shards between the group's
+	// consumers and sends a new Assignment each time a consumer joins or leaves.
+	Join(*JoinRequest, grpc.ServerStreamingServer[Assignment]) error
+	// Commit stores where a group has read a shard up to. Only the shard's
+	// current owner can commit: any other caller gets FAILED_PRECONDITION.
+	Commit(context.Context, *CommitRequest) (*CommitResponse, error)
 	mustEmbedUnimplementedEventBrokerServer()
 }
 
@@ -122,6 +167,12 @@ func (UnimplementedEventBrokerServer) Publish(grpc.BidiStreamingServer[PublishRe
 }
 func (UnimplementedEventBrokerServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[EventBatch]) error {
 	return status.Error(codes.Unimplemented, "method Subscribe not implemented")
+}
+func (UnimplementedEventBrokerServer) Join(*JoinRequest, grpc.ServerStreamingServer[Assignment]) error {
+	return status.Error(codes.Unimplemented, "method Join not implemented")
+}
+func (UnimplementedEventBrokerServer) Commit(context.Context, *CommitRequest) (*CommitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Commit not implemented")
 }
 func (UnimplementedEventBrokerServer) mustEmbedUnimplementedEventBrokerServer() {}
 func (UnimplementedEventBrokerServer) testEmbeddedByValue()                     {}
@@ -180,6 +231,35 @@ func _EventBroker_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type EventBroker_SubscribeServer = grpc.ServerStreamingServer[EventBatch]
 
+func _EventBroker_Join_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(JoinRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EventBrokerServer).Join(m, &grpc.GenericServerStream[JoinRequest, Assignment]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type EventBroker_JoinServer = grpc.ServerStreamingServer[Assignment]
+
+func _EventBroker_Commit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventBrokerServer).Commit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EventBroker_Commit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventBrokerServer).Commit(ctx, req.(*CommitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EventBroker_ServiceDesc is the grpc.ServiceDesc for EventBroker service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -190,6 +270,10 @@ var EventBroker_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DescribeTopic",
 			Handler:    _EventBroker_DescribeTopic_Handler,
+		},
+		{
+			MethodName: "Commit",
+			Handler:    _EventBroker_Commit_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -202,6 +286,11 @@ var EventBroker_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Subscribe",
 			Handler:       _EventBroker_Subscribe_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Join",
+			Handler:       _EventBroker_Join_Handler,
 			ServerStreams: true,
 		},
 	},

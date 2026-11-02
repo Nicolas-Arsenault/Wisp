@@ -48,12 +48,15 @@ type Shard struct {
 	indexed   atomic.Uint64                 // number of entries in the .index
 	notify    atomic.Pointer[chan struct{}] // closed after each commit to wake Wait
 
-	lastIndexed int64 // .log position of the last index entry (writer only)
+	lastIndexed int64             // .log position of the last index entry (writer only)
+	producers   map[uint64]uint64 // producer id -> last stored sequence (writer only)
 }
 
 type appendRequest struct {
-	body []byte // compressed payload
-	done chan appendResult
+	body     []byte // compressed payload
+	producer uint64 // 0: no duplicate check
+	sequence uint64
+	done     chan appendResult
 }
 
 type appendResult struct {
@@ -95,11 +98,16 @@ func Open(dataDir, topic string, id int) (*Shard, error) {
 		queue:      make(chan appendRequest, queueSize),
 		quit:       make(chan struct{}),
 		writerDone: make(chan struct{}),
+		producers:  make(map[uint64]uint64),
 	}
 	ch := make(chan struct{})
 	s.notify.Store(&ch)
 
-	if err := s.recover(); err != nil {
+	err = s.recover()
+	if err == nil {
+		err = s.loadProducers()
+	}
+	if err != nil {
 		idx.close()
 		logFile.Close()
 		return nil, err
@@ -154,11 +162,11 @@ func (s *Shard) scan(entry, id uint64, pos, size int64) (uint64, int64, error) {
 	s.indexed.Store(entry)
 	r := bufio.NewReader(io.NewSectionReader(s.log, pos, size-pos))
 	for pos < size {
-		frameID, _, body, err := readFrame(r)
+		f, err := readFrame(r)
 		if err != nil {
 			return id, pos, err
 		}
-		if frameID != id {
+		if f.id != id {
 			return id, pos, ErrCorruptRecord
 		}
 		if n := s.indexed.Load(); n == entry || pos-s.lastIndexed >= indexInterval {
@@ -169,16 +177,44 @@ func (s *Shard) scan(entry, id uint64, pos, size int64) (uint64, int64, error) {
 			s.indexed.Store(n + 1)
 			s.lastIndexed = pos
 		}
-		pos += frameSize(len(body))
+		pos += frameSize(len(f.body))
 		id++
 	}
 	return id, pos, nil
 }
 
-// Enqueue validates and compresses payload, then puts it on the queue,
-// blocking while the queue is full. Records enqueued in order are stored
-// in that order.
+// loadProducers reads the whole .log to find each producer's last sequence,
+// so duplicates are still caught after a restart. A log it can't fully read
+// stops Open: accepting records could then store duplicates.
+func (s *Shard) loadProducers() error {
+	r := bufio.NewReader(io.NewSectionReader(s.log, 0, s.logEnd.Load()))
+	for {
+		f, err := readFrame(r)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if f.producer != 0 {
+			s.producers[f.producer] = f.sequence
+		}
+	}
+}
+
+// Enqueue is EnqueueFrom without a duplicate check.
 func (s *Shard) Enqueue(ctx context.Context, payload []byte) (*Pending, error) {
+	return s.EnqueueFrom(ctx, payload, 0, 0)
+}
+
+// EnqueueFrom validates and compresses payload, then puts it on the queue,
+// blocking while the queue is full. Records enqueued in order are stored in
+// that order.
+//
+// If producer isn't 0, sequence must be the producer's last one + 1. Wait
+// then returns ErrDuplicate if it's lower and ErrOutOfOrder if it's higher,
+// and nothing is stored.
+func (s *Shard) EnqueueFrom(ctx context.Context, payload []byte, producer, sequence uint64) (*Pending, error) {
 	if err := ValidatePayload(payload); err != nil {
 		return nil, err
 	}
@@ -192,7 +228,7 @@ func (s *Shard) Enqueue(ctx context.Context, payload []byte) (*Pending, error) {
 	default:
 	}
 
-	req := appendRequest{body: body, done: make(chan appendResult, 1)}
+	req := appendRequest{body: body, producer: producer, sequence: sequence, done: make(chan appendResult, 1)}
 	select {
 	case s.queue <- req:
 		return &Pending{shard: s, done: req.done}, nil
@@ -262,6 +298,7 @@ func (s *Shard) drain(batch []appendRequest) []appendRequest {
 // commit writes batch to the .log, fsyncs, adds the index entries (one
 // each time the .log has grown by indexInterval), then answers each request.
 func (s *Shard) commit(batch []appendRequest) {
+	batch = s.checkSequences(batch)
 	next := s.committed.Load()
 	start := s.logEnd.Load()
 	indexed := s.indexed.Load()
@@ -288,7 +325,7 @@ func (s *Shard) commit(batch []appendRequest) {
 			entries = append(entries, entry{id, pos})
 			lastIndexed = pos
 		}
-		buf = appendFrame(buf, id, now, req.body)
+		buf = appendFrame(buf, frame{id: id, timestamp: now, producer: req.producer, sequence: req.sequence, body: req.body})
 	}
 	if len(batch) == 0 {
 		return
@@ -318,8 +355,38 @@ func (s *Shard) commit(batch []appendRequest) {
 	close(*s.notify.Swap(&ch))
 
 	for i, req := range batch {
+		if req.producer != 0 {
+			s.producers[req.producer] = req.sequence
+		}
 		req.done <- appendResult{id: next + uint64(i)}
 	}
+}
+
+// checkSequences answers the requests that must not be stored and returns
+// the others.
+func (s *Shard) checkSequences(batch []appendRequest) []appendRequest {
+	var kept []appendRequest
+	last := make(map[uint64]uint64) // sequences in this batch, not yet stored
+	for _, req := range batch {
+		if req.producer == 0 {
+			kept = append(kept, req)
+			continue
+		}
+		prev, ok := last[req.producer]
+		if !ok {
+			prev = s.producers[req.producer]
+		}
+		switch {
+		case req.sequence <= prev:
+			req.done <- appendResult{err: ErrDuplicate}
+		case req.sequence > prev+1:
+			req.done <- appendResult{err: ErrOutOfOrder}
+		default:
+			last[req.producer] = req.sequence
+			kept = append(kept, req)
+		}
+	}
+	return kept
 }
 
 // NextID returns the id the next record will get.
@@ -347,24 +414,24 @@ func (s *Shard) ReadFrom(start uint64, maxBytes int) ([]Record, error) {
 	var records []Record
 	total := 0
 	for ; id < committed && (len(records) == 0 || total < maxBytes); id++ {
-		frameID, timestamp, body, err := readFrame(r)
+		f, err := readFrame(r)
 		if err != nil {
 			return nil, err
 		}
-		if frameID != id {
-			return nil, fmt.Errorf("%w: found event %d, want %d", ErrCorruptRecord, frameID, id)
+		if f.id != id {
+			return nil, fmt.Errorf("%w: found event %d, want %d", ErrCorruptRecord, f.id, id)
 		}
 		if id < start {
 			continue // before the offset asked for
 		}
-		payload, err := decompress(body)
+		payload, err := decompress(f.body)
 		if err != nil {
 			return nil, err
 		}
 		if len(records) > 0 && total+len(payload) > maxBytes {
 			break
 		}
-		records = append(records, Record{ID: id, Timestamp: timestamp, Payload: payload})
+		records = append(records, Record{ID: id, Timestamp: f.timestamp, Payload: payload})
 		total += len(payload)
 	}
 	return records, nil

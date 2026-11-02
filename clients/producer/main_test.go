@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"wisp/partition"
 	pb "wisp/proto"
 
@@ -28,6 +31,39 @@ type fakeBroker struct {
 
 	mu       sync.Mutex
 	received []*pb.PublishRequest
+	streamOf []int // stream of each received request
+	streams  int
+}
+
+func (f *fakeBroker) newStream() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streams++
+	return f.streams
+}
+
+// failOnce returns a code func that answers code the first time it sees
+// payload, then accepts everything.
+func failOnce(payload string, code codes.Code) func(*pb.PublishRequest) codes.Code {
+	var mu sync.Mutex
+	failed := false
+	return func(req *pb.PublishRequest) codes.Code {
+		mu.Lock()
+		defer mu.Unlock()
+		if string(req.GetPayload()) == payload && !failed {
+			failed = true
+			return code
+		}
+		return codes.OK
+	}
+}
+
+// fastRetries makes retries immediate for one test.
+func fastRetries(t *testing.T) {
+	t.Helper()
+	old := retryDelay
+	retryDelay = time.Millisecond
+	t.Cleanup(func() { retryDelay = old })
 }
 
 func (f *fakeBroker) DescribeTopic(_ context.Context, req *pb.DescribeTopicRequest) (*pb.TopicInfo, error) {
@@ -35,6 +71,7 @@ func (f *fakeBroker) DescribeTopic(_ context.Context, req *pb.DescribeTopicReque
 }
 
 func (f *fakeBroker) Publish(stream pb.EventBroker_PublishServer) error {
+	id := f.newStream()
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -45,6 +82,7 @@ func (f *fakeBroker) Publish(stream pb.EventBroker_PublishServer) error {
 		}
 		f.mu.Lock()
 		f.received = append(f.received, req)
+		f.streamOf = append(f.streamOf, id)
 		f.mu.Unlock()
 
 		ack := &pb.PublishAck{RequestId: req.GetRequestId(), Shard: req.GetShard()}
@@ -68,6 +106,7 @@ func (f *fakeBroker) payloads() string {
 	for _, req := range f.requests() {
 		out = append(out, string(req.GetPayload()))
 	}
+	slices.Sort(out) // shards are sent independently
 	return strings.Join(out, ",")
 }
 
@@ -114,7 +153,7 @@ func TestRunPublishesEachLine(t *testing.T) {
 // Each line goes to the shard of its key.
 func TestRunHashesKeyToShard(t *testing.T) {
 	broker := &fakeBroker{}
-	in := `{"dev":"a","n":1}` + "\n" + `{"dev":42}` + "\n" + `{"other":1}` + "\n"
+	in := `{"dev":"a","n":1}` + "\n" + `{"dev":42}` + "\n"
 
 	if _, err := run(t.Context(), newClient(t, broker), "t", "dev", strings.NewReader(in)); err != nil {
 		t.Fatal(err)
@@ -122,11 +161,10 @@ func TestRunHashesKeyToShard(t *testing.T) {
 	want := []int{
 		partition.Shard([]byte("a"), testShards),  // string: without quotes
 		partition.Shard([]byte("42"), testShards), // number: as JSON text
-		partition.Shard(nil, testShards),          // no field: empty key
 	}
-	for i, req := range broker.requests() {
-		if int(req.GetShard()) != want[i] {
-			t.Errorf("line %d went to shard %d, want %d", i+1, req.GetShard(), want[i])
+	for _, req := range broker.requests() {
+		if line := req.GetRequestId(); int(req.GetShard()) != want[line-1] {
+			t.Errorf("line %d went to shard %d, want %d", line, req.GetShard(), want[line-1])
 		}
 	}
 }
@@ -139,39 +177,176 @@ func TestRunEmptyInput(t *testing.T) {
 	}
 }
 
-// A rejected event is skipped; the following ones are still published.
-func TestRunSkipsInvalidEvents(t *testing.T) {
-	broker := &fakeBroker{code: func(req *pb.PublishRequest) codes.Code {
-		if string(req.GetPayload()) == "bad" {
-			return codes.InvalidArgument
+// Lines without a key take turns over the shards, with or without -key-field.
+func TestRunRoundRobinWithoutKey(t *testing.T) {
+	for _, keyField := range []string{"", "dev"} {
+		broker := &fakeBroker{}
+		in := strings.Repeat(`{"n":1}`+"\n", testShards*2)
+		if _, err := run(t.Context(), newClient(t, broker), "t", keyField, strings.NewReader(in)); err != nil {
+			t.Fatal(err)
 		}
-		return codes.OK
-	}}
-
-	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\nbad\n{\"n\":2}\n"))
-	if err != nil || sent != 2 {
-		t.Fatalf("run = %d, %v, want 2, nil", sent, err)
-	}
-	if len(broker.requests()) != 3 {
-		t.Errorf("broker got %s, want all 3 lines", broker.payloads())
+		perShard := map[int32]int{}
+		for _, req := range broker.requests() {
+			perShard[req.GetShard()]++
+			if want := int32(req.GetRequestId()-1) % testShards; req.GetShard() != want {
+				t.Errorf("line %d went to shard %d, want %d", req.GetRequestId(), req.GetShard(), want)
+			}
+		}
+		for shard := range int32(testShards) {
+			if perShard[shard] != 2 {
+				t.Errorf("key field %q: shard %d got %d lines, want 2", keyField, shard, perShard[shard])
+			}
+		}
 	}
 }
 
-// Any other error ack stops the producer and names the line.
+// An invalid line is skipped without being sent, and uses no sequence: a gap
+// would make the broker refuse every line after it.
+func TestRunSkipsInvalidEvents(t *testing.T) {
+	broker := &fakeBroker{}
+	sent, err := run(t.Context(), newClient(t, broker), "t", "key", strings.NewReader(
+		"{\"key\":\"a\",\"n\":1}\nbad\n{\"key\":\"a\",\"n\":2}\n"))
+	if err != nil || sent != 2 {
+		t.Fatalf("run = %d, %v, want 2, nil", sent, err)
+	}
+	var sequences []uint64
+	for _, req := range broker.requests() {
+		sequences = append(sequences, req.GetSequence())
+	}
+	if fmt.Sprint(sequences) != "[1 2]" {
+		t.Errorf("sequences = %v, want [1 2]", sequences)
+	}
+}
+
+// Each shard has its own stream and its own sequence, under one producer id.
+func TestRunOneStreamPerShard(t *testing.T) {
+	broker := &fakeBroker{}
+	in := strings.Repeat(`{"n":1}`+"\n", testShards*3)
+	if _, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader(in)); err != nil {
+		t.Fatal(err)
+	}
+
+	streamShard := map[int]int32{}
+	lastSequence := map[int32]uint64{}
+	producers := map[uint64]bool{}
+	for i, req := range broker.requests() {
+		stream := broker.streamOf[i]
+		if shard, ok := streamShard[stream]; ok && shard != req.GetShard() {
+			t.Errorf("stream %d has shards %d and %d", stream, shard, req.GetShard())
+		}
+		streamShard[stream] = req.GetShard()
+		lastSequence[req.GetShard()]++
+		if req.GetSequence() != lastSequence[req.GetShard()] {
+			t.Errorf("shard %d: sequence %d, want %d", req.GetShard(), req.GetSequence(), lastSequence[req.GetShard()])
+		}
+		producers[req.GetProducerId()] = true
+	}
+	if len(producers) != 1 || producers[0] {
+		t.Errorf("producer ids = %v, want one that isn't 0", producers)
+	}
+}
+
+// A shard that doesn't answer holds up none of the others.
+func TestRunStuckShardDoesNotBlockOthers(t *testing.T) {
+	release := make(chan struct{})
+	acked := make(chan struct{}, testShards)
+	broker := &fakeBroker{code: func(req *pb.PublishRequest) codes.Code {
+		if req.GetShard() == 0 {
+			<-release
+		} else {
+			acked <- struct{}{}
+		}
+		return codes.OK
+	}}
+	in := strings.Repeat(`{"n":1}`+"\n", testShards)
+	done := make(chan error, 1)
+	client := newClient(t, broker)
+	go func() {
+		_, err := run(t.Context(), client, "t", "", strings.NewReader(in))
+		done <- err
+	}()
+
+	for range testShards - 1 {
+		select {
+		case <-acked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the other shards are blocked")
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// After a failed write, the record and those behind it are sent again in
+// order, each counted once.
+func TestRunRetriesFromFirstUnacked(t *testing.T) {
+	fastRetries(t)
+	broker := &fakeBroker{code: failOnce(`{"key":"a","n":2}`, codes.Internal)}
+	in := "{\"key\":\"a\",\"n\":1}\n{\"key\":\"a\",\"n\":2}\n{\"key\":\"a\",\"n\":3}\n"
+
+	sent, err := run(t.Context(), newClient(t, broker), "t", "key", strings.NewReader(in))
+	if err != nil || sent != 3 {
+		t.Fatalf("run = %d, %v, want 3, nil", sent, err)
+	}
+	var last [4]uint64
+	for _, req := range broker.requests() {
+		last[req.GetRequestId()] = req.GetSequence()
+	}
+	if last != [4]uint64{0, 1, 2, 3} {
+		t.Errorf("sequences by line = %v, want each line to keep its sequence", last)
+	}
+	first := broker.requests()[0]
+	for _, req := range broker.requests()[1:] {
+		if req.GetProducerId() != first.GetProducerId() {
+			t.Error("a retry changed the producer id")
+		}
+	}
+	if broker.streams <= testShards {
+		t.Errorf("%d streams, want a new one for the retry", broker.streams)
+	}
+}
+
+// ALREADY_EXISTS means an earlier attempt stored the record.
+func TestRunCountsDuplicateAsStored(t *testing.T) {
+	broker := &fakeBroker{code: func(*pb.PublishRequest) codes.Code { return codes.AlreadyExists }}
+	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\n"))
+	if err != nil || sent != 1 {
+		t.Errorf("run = %d, %v, want 1, nil", sent, err)
+	}
+}
+
+func TestRunGivesUpAfterRetries(t *testing.T) {
+	fastRetries(t)
+	broker := &fakeBroker{code: func(*pb.PublishRequest) codes.Code { return codes.Unavailable }}
+	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\n"))
+	if status.Code(errors.Unwrap(err)) != codes.Unavailable || sent != 0 {
+		t.Fatalf("run = %d, %v, want 0, Unavailable", sent, err)
+	}
+	if got := len(broker.requests()); got != maxRetries {
+		t.Errorf("sent %d times, want %d", got, maxRetries)
+	}
+}
+
+// An error a retry can't fix stops the producer and names the line.
 func TestRunStopsOnBrokerError(t *testing.T) {
 	broker := &fakeBroker{code: func(req *pb.PublishRequest) codes.Code {
-		if string(req.GetPayload()) == `{"n":2}` {
-			return codes.Internal
+		if req.GetRequestId() == 2 {
+			return codes.ResourceExhausted
 		}
 		return codes.OK
 	}}
 
-	sent, err := run(t.Context(), newClient(t, broker), "t", "", strings.NewReader("{\"n\":1}\n{\"n\":2}\n"))
-	if status.Code(errors.Unwrap(err)) != codes.Internal || !strings.Contains(err.Error(), "line 2") {
-		t.Fatalf("err = %v, want Internal error mentioning line 2", err)
+	sent, err := run(t.Context(), newClient(t, broker), "t", "key", strings.NewReader("{\"key\":\"a\"}\n{\"key\":\"a\"}\n"))
+	if status.Code(errors.Unwrap(err)) != codes.ResourceExhausted || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("err = %v, want ResourceExhausted error mentioning line 2", err)
 	}
 	if sent != 1 {
 		t.Errorf("sent = %d, want 1", sent)
+	}
+	if got := len(broker.requests()); got != 2 {
+		t.Errorf("sent %d requests, want no retry", got)
 	}
 }
 

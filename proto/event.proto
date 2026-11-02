@@ -14,6 +14,13 @@ service EventBroker {
   // Subscribe streams one shard from start_id (or from its end if latest is
   // set): first every stored record, then new records as they are written.
   rpc Subscribe (SubscribeRequest) returns (stream EventBatch);
+  // Join registers a consumer in a group of a topic for as long as the stream
+  // is open. The broker splits the topic's shards between the group's
+  // consumers and sends a new Assignment each time a consumer joins or leaves.
+  rpc Join (JoinRequest) returns (stream Assignment);
+  // Commit stores where a group has read a shard up to. Only the shard's
+  // current owner can commit: any other caller gets FAILED_PRECONDITION.
+  rpc Commit (CommitRequest) returns (CommitResponse);
 }
 
 message DescribeTopicRequest {
@@ -33,6 +40,11 @@ message PublishRequest {
   int32 shard = 3;
   // payload must be a JSON object. It is stored as-is.
   bytes payload = 4;
+  // producer_id and sequence let the broker drop retried records. sequence
+  // counts a producer's records on one shard: 1, 2, 3, ... A producer_id of 0
+  // turns this off. See PublishAck for the error codes.
+  uint64 producer_id = 5;
+  uint64 sequence = 6;
 }
 
 message PublishAck {
@@ -42,7 +54,9 @@ message PublishAck {
   // Only set when error_code is 0.
   uint64 event_id = 3;
   // error_code is a gRPC status code (google.golang.org/grpc/codes);
-  // 0 (OK) means the record is stored on disk.
+  // 0 (OK) means the record is stored on disk. ALREADY_EXISTS means it was
+  // stored by an earlier attempt. FAILED_PRECONDITION means an earlier
+  // sequence is missing: resend from the first record not yet acked.
   int32 error_code = 4;
   string error_message = 5;
 }
@@ -50,13 +64,17 @@ message PublishAck {
 message SubscribeRequest {
   string topic = 1;
   int32 shard = 2;
-  // start_id is the first event_id to send. Ignored when latest is true.
+  // start_id is the first event_id to send. Ignored when latest is true, or
+  // when group has a stored offset for this shard.
   uint64 start_id = 3;
   // latest starts at the end of the shard: only new records are sent.
   bool latest = 4;
   // max_bytes caps the payload bytes in one EventBatch (0 = broker default).
   // A batch always holds at least one record.
   uint32 max_bytes = 5;
+  // group, if set, starts at the group's stored offset. If it has none, the
+  // start position above becomes its stored offset.
+  string group = 6;
 }
 
 message Event {
@@ -71,3 +89,34 @@ message EventBatch {
   int32 shard = 2;
   repeated Event events = 3;
 }
+
+message JoinRequest {
+  string topic = 1;
+  // consumer_id must be unique in the group.
+  string consumer_id = 2;
+  // group is who shares the shards. Empty means "default". Each group reads
+  // the whole topic.
+  string group = 3;
+}
+
+message Assignment {
+  string topic = 1;
+  // generation increases with each rebalance of the group.
+  uint64 generation = 2;
+  // shards this consumer should read now.
+  repeated int32 shards = 3;
+}
+
+message CommitRequest {
+  string topic = 1;
+  // group is the group of the Join. Empty means "default".
+  string group = 2;
+  string consumer_id = 3;
+  // generation is that of the consumer's latest Assignment.
+  uint64 generation = 4;
+  int32 shard = 5;
+  // next_id is the first event_id not yet processed.
+  uint64 next_id = 6;
+}
+
+message CommitResponse {}
