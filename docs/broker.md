@@ -14,21 +14,21 @@ Returns the topic's number of shards and creates the topic if needed. Producers 
 
 A long-lived stream. The command-line producer opens one per shard, so a full shard only slows its own stream.
 
-- **Request:** `{request_id, topic, shard, payload, producer_id, sequence}`. The shard is computed by the producer.
-- **Writing:** each request is put on that shard's queue, in the order received.
-- **Ack:** each request gets one ack, in request order, once the record is on disk: `{request_id, shard, event_id}`.
+- **Request:** `{request_id, topic, shard, payloads, producer_id, first_sequence}`, a batch of records. The shard is computed by the producer.
+- **Writing:** each request is put on that shard's queue, in the order received. Its records are stored together, in one fsync: all of them or none. One invalid payload rejects the request.
+- **Ack:** each request gets one ack, in request order, once its records are on disk: `{request_id, shard, first_event_id, count}`. `count` is how many records were added.
 - **Errors:** a bad request gets an ack with `error_code` set, and the stream stays open.
 
   | Error | Cause |
   |---|---|
   | `INVALID_ARGUMENT` | not a JSON object, bad topic name, or shard out of range |
-  | `RESOURCE_EXHAUSTED` | the shard's index is full |
+  | `RESOURCE_EXHAUSTED` | the shard's index can't grow, e.g. the disk is full |
   | `UNAVAILABLE` | the broker is shutting down |
   | `INTERNAL` | the write failed |
   | `ALREADY_EXISTS` | the record was stored by an earlier attempt; nothing was added |
   | `FAILED_PRECONDITION` | an earlier sequence is missing; resend from the first record not acked |
-- **Duplicates:** with a `producer_id`, `sequence` must count that producer's records on the shard: 1, 2, 3, … A lower one is dropped (`ALREADY_EXISTS`) and a higher one is refused (`FAILED_PRECONDITION`), so a retry can't store a record twice or out of order. `producer_id` 0 turns this off. Use a new id whenever the numbering restarts: a reused id with sequences from 1 is dropped as duplicates.
-- **Backpressure:** if a shard queue is full, or 256 acks are waiting, the broker stops reading the stream until there is room.
+- **Duplicates:** with a `producer_id`, sequences count that producer's records on the shard: 1, 2, 3, …, and `first_sequence` is that of the first payload. A request that's already stored is dropped (`ALREADY_EXISTS`), a partly stored one adds only its new records, and one that leaves a gap is refused (`FAILED_PRECONDITION`), so a retry can't store a record twice or out of order. `producer_id` 0 turns this off. Use a new id whenever the numbering restarts: a reused id with sequences from 1 is dropped as duplicates. Each shard remembers its 1024 most recently active producers (see [shards.md](shards.md)).
+- **Backpressure:** if a shard queue is full, or 256 requests are waiting for their ack, the broker stops reading the stream until there is room.
 
 ### `Subscribe(topic, shard, start_id, latest, max_bytes, group)`
 
@@ -79,7 +79,7 @@ An empty `group` means `default`. Each group reads the whole topic, so two apps 
 Stores `next_id`, the first event not yet processed, as the group's offset for the shard. The next `Subscribe` of the group starts there, also after a broker restart. Offsets are in `<dataDir>/<topic>/groups/<group>/<shard>.offset`.
 
 - **Fencing:** only the shard's owner, using the group's current generation, can commit. This stops a consumer that lost a shard from overwriting the new owner's offset.
-- **Delivery:** at-least-once. Consumers commit after processing, so a crash or rebalance re-reads what wasn't committed, but nothing is skipped.
+- **Delivery:** at-least-once. Consumers commit after processing, so a crash or rebalance re-reads what wasn't committed, but nothing is skipped. The command-line consumer commits once a second and when it stops.
 - **Handoff:** the broker doesn't wait for the old owner to stop, so two consumers can briefly read the same shard. Only `Commit` is checked; `Subscribe` isn't.
 - **Durability:** offset files aren't fsynced, to keep commits cheap. A power cut can lose a recent offset, which re-reads records. A damaged offset file is logged and treated as no offset.
 - **Errors:**
@@ -104,8 +104,9 @@ On Ctrl+C or SIGTERM, the broker:
 - **RPCs:** `PublishEvent` and `SubscribeTopic` are replaced by `DescribeTopic`, `Publish` and `Subscribe`.
 - **Event id:** now a number per shard (it was the string `topic/shard/seq_n`).
 - **Payloads:** no longer contain `seq_n`.
-- **On-disk format:** new, and old data isn't supported. Frames now hold the producer id and sequence, so data written before this change can't be read either. Delete `../data` before upgrading.
-- **Producers:** the command-line producer now opens one `Publish` stream per shard, and sends lines without a key round robin.
+- **On-disk format:** new, and old data isn't supported. Frames now hold the producer id and sequence and are compressed with S2 instead of zlib, so data written before this change can't be read either. Delete `../data` before upgrading.
+- **Publish:** requests hold many records (`payloads`, `first_sequence`), and acks have `first_event_id` and `count`.
+- **Producers:** the command-line producer now opens one `Publish` stream per shard, sends lines without a key round robin, keeps unacked lines in a local spool, reuses producer ids between runs, and retries without limit.
 - **Rebalancing:** shards are now kept where they are when possible, instead of going to consumer `i % n`.
 - **Consumers:** they now resume from their group's stored offset, so `-offset` and `-latest` only apply to a shard the group has no offset for.
 
@@ -113,7 +114,7 @@ On Ctrl+C or SIGTERM, the broker:
 
 These run the real broker over an in-memory connection, with its data in a temp dir:
 
-- **Publish:** acks, error acks, and dropped retries.
+- **Publish:** acks, error acks, batches, and dropped retries.
 - **Subscribe:** replay then live, `latest`, `max_bytes` batching, and errors.
 - **Join:** the A/B/C rebalance flow, every shard having exactly one owner, shards staying put, independent groups, and errors.
 - **Commit:** an offset following its shard to a new owner, a stored `latest` position, and fencing.

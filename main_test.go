@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"testing"
@@ -20,7 +21,7 @@ import (
 
 // newTestClient starts the broker on an in-memory connection, with its data
 // in a temp dir.
-func newTestClient(t *testing.T) pb.EventBrokerClient {
+func newTestClient(t testing.TB) pb.EventBrokerClient {
 	t.Helper()
 	topics, err := stream.OpenRegistry(t.TempDir())
 	if err != nil {
@@ -75,7 +76,7 @@ func publish(t *testing.T, client pb.EventBrokerClient, reqs ...*pb.PublishReque
 }
 
 func req(id uint64, shard int32, payload string) *pb.PublishRequest {
-	return &pb.PublishRequest{RequestId: id, Topic: "t", Shard: shard, Payload: []byte(payload)}
+	return &pb.PublishRequest{RequestId: id, Topic: "t", Shard: shard, Payloads: [][]byte{[]byte(payload)}}
 }
 
 func TestDescribeTopic(t *testing.T) {
@@ -116,8 +117,8 @@ func TestPublishAcks(t *testing.T) {
 		if ack.GetRequestId() != uint64(i+1) {
 			t.Errorf("ack %d has request id %d", i, ack.GetRequestId())
 		}
-		if codes.Code(ack.GetErrorCode()) != want[i].code || ack.GetEventId() != want[i].eventID {
-			t.Errorf("ack %d = code %d, id %d, want %v, %d", i, ack.GetErrorCode(), ack.GetEventId(), want[i].code, want[i].eventID)
+		if codes.Code(ack.GetErrorCode()) != want[i].code || ack.GetFirstEventId() != want[i].eventID {
+			t.Errorf("ack %d = code %d, id %d, want %v, %d", i, ack.GetErrorCode(), ack.GetFirstEventId(), want[i].code, want[i].eventID)
 		}
 	}
 }
@@ -516,7 +517,7 @@ func TestPublishDropsRetries(t *testing.T) {
 	client := newTestClient(t)
 	seq := func(id, sequence uint64) *pb.PublishRequest {
 		r := req(id, 0, `{}`)
-		r.ProducerId, r.Sequence = 7, sequence
+		r.ProducerId, r.FirstSequence = 7, sequence
 		return r
 	}
 	acks := publish(t, client, seq(1, 1), seq(2, 2), seq(3, 2), seq(4, 9), seq(5, 3))
@@ -526,7 +527,171 @@ func TestPublishDropsRetries(t *testing.T) {
 			t.Errorf("ack %d = %d, want %v", i, ack.GetErrorCode(), want[i])
 		}
 	}
-	if id := acks[4].GetEventId(); id != 2 {
+	if id := acks[4].GetFirstEventId(); id != 2 {
 		t.Errorf("last record has id %d, want 2 (one duplicate dropped)", id)
+	}
+}
+
+// quietLogs stops broker logs from mixing with benchmark results.
+func quietLogs(b *testing.B) {
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	b.Cleanup(func() { slog.SetDefault(old) })
+}
+
+const benchEvent = `{"device":"sensor-42","temp":21.5,"humidity":48,"status":"ok","ts":1793137200123}`
+
+// One stream per shard sends batches as fast as acks allow, like the producer.
+func BenchmarkPublish(b *testing.B) {
+	quietLogs(b)
+	client := newTestClient(b)
+	b.SetBytes(int64(len(benchEvent)))
+	b.ReportAllocs()
+	const numShards = 5
+	perShard := b.N / numShards
+	b.ResetTimer()
+
+	done := make(chan error, numShards)
+	for shard := range int32(numShards) {
+		go func() {
+			stream, err := client.Publish(b.Context())
+			if err != nil {
+				done <- err
+				return
+			}
+			go func() {
+				const batch = 256
+				for i := 0; i < perShard; i += batch {
+					r := &pb.PublishRequest{RequestId: uint64(i), Topic: "t", Shard: shard}
+					for range min(batch, perShard-i) {
+						r.Payloads = append(r.Payloads, []byte(benchEvent))
+					}
+					stream.Send(r)
+				}
+				stream.CloseSend()
+			}()
+			for {
+				if _, err := stream.Recv(); err != nil {
+					if err == io.EOF {
+						err = nil
+					}
+					done <- err
+					return
+				}
+			}
+		}()
+	}
+	for range numShards {
+		if err := <-done; err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A consumer reading stored records over gRPC.
+func BenchmarkSubscribe(b *testing.B) {
+	quietLogs(b)
+	client := newTestClient(b)
+	const stored = 20_000
+	stream, err := client.Publish(b.Context())
+	if err != nil {
+		b.Fatal(err)
+	}
+	go func() {
+		for i := range stored {
+			stream.Send(req(uint64(i), 0, benchEvent))
+		}
+		stream.CloseSend()
+	}()
+	for {
+		if _, err := stream.Recv(); err != nil {
+			break
+		}
+	}
+
+	b.SetBytes(int64(len(benchEvent)))
+	b.ReportAllocs()
+	ctx, cancel := context.WithCancel(b.Context())
+	defer cancel()
+	var sub pb.EventBroker_SubscribeClient
+	got, left := 0, 0
+	for b.Loop() {
+		if left == 0 {
+			if sub, err = client.Subscribe(ctx, &pb.SubscribeRequest{Topic: "t"}); err != nil {
+				b.Fatal(err)
+			}
+			left = stored
+		}
+		if got == 0 {
+			batch, err := sub.Recv()
+			if err != nil {
+				b.Fatal(err)
+			}
+			got = len(batch.GetEvents())
+		}
+		got--
+		left--
+	}
+}
+
+// A batch of records is stored as one unit, and acked once.
+func TestPublishBatch(t *testing.T) {
+	client := newTestClient(t)
+	batch := func(id uint64, payloads ...string) *pb.PublishRequest {
+		r := req(id, 0, "")
+		r.Payloads = nil
+		for _, p := range payloads {
+			r.Payloads = append(r.Payloads, []byte(p))
+		}
+		return r
+	}
+	acks := publish(t, client,
+		batch(1, `{"n":0}`, `{"n":1}`, `{"n":2}`),
+		batch(2, `{"n":3}`, `not json`), // nothing of it is stored
+		batch(3),                        // empty
+		batch(4, `{"n":3}`),
+	)
+	want := []struct {
+		code  codes.Code
+		first uint64
+		count uint32
+	}{{codes.OK, 0, 3}, {codes.InvalidArgument, 0, 0}, {codes.InvalidArgument, 0, 0}, {codes.OK, 3, 1}}
+	for i, ack := range acks {
+		w := want[i]
+		if codes.Code(ack.GetErrorCode()) != w.code || ack.GetFirstEventId() != w.first || ack.GetCount() != w.count {
+			t.Errorf("ack %d = %v, want %+v", i, ack, w)
+		}
+	}
+	sub := subscribe(t, client, &pb.SubscribeRequest{Topic: "t"})
+	for i, e := range receive(t, sub, 4) {
+		if want := fmt.Sprintf(`{"n":%d}`, i); string(e.GetPayload()) != want {
+			t.Errorf("event %d = %s, want %s", i, e.GetPayload(), want)
+		}
+	}
+}
+
+// A resent batch stores only what the first attempt didn't.
+func TestPublishPartlyStoredBatch(t *testing.T) {
+	client := newTestClient(t)
+	seq := func(first uint64, n int) *pb.PublishRequest {
+		r := req(first, 0, "")
+		r.Payloads, r.ProducerId, r.FirstSequence = nil, 7, first
+		for range n {
+			r.Payloads = append(r.Payloads, []byte(`{}`))
+		}
+		return r
+	}
+	acks := publish(t, client, seq(1, 2), seq(1, 3), seq(1, 3), seq(9, 1))
+	want := []struct {
+		code  codes.Code
+		count uint32
+	}{{codes.OK, 2}, {codes.OK, 1}, {codes.AlreadyExists, 0}, {codes.FailedPrecondition, 0}}
+	for i, ack := range acks {
+		if codes.Code(ack.GetErrorCode()) != want[i].code || ack.GetCount() != want[i].count {
+			t.Errorf("ack %d = %v, want %+v", i, ack, want[i])
+		}
+	}
+	if id := acks[1].GetFirstEventId(); id != 2 {
+		t.Errorf("first new record has id %d, want 2", id)
 	}
 }

@@ -7,9 +7,9 @@ service EventBroker {
   // DescribeTopic returns how many shards a topic has, creating the topic if
   // it doesn't exist yet. Producers call it once to hash keys to shards.
   rpc DescribeTopic (DescribeTopicRequest) returns (TopicInfo);
-  // Publish is a long-lived producer stream. Each request goes to the shard
-  // the producer chose; the broker answers every request with one ack, in
-  // request order.
+  // Publish is a long-lived producer stream. Each request holds records of
+  // the shard the producer chose; the broker answers every request with one
+  // ack, in request order.
   rpc Publish (stream PublishRequest) returns (stream PublishAck);
   // Subscribe streams one shard from start_id (or from its end if latest is
   // set): first every stored record, then new records as they are written.
@@ -38,27 +38,34 @@ message PublishRequest {
   string topic = 2;
   // shard is hash(partition key) % num_shards, computed by the producer.
   int32 shard = 3;
-  // payload must be a JSON object. It is stored as-is.
-  bytes payload = 4;
-  // producer_id and sequence let the broker drop retried records. sequence
-  // counts a producer's records on one shard: 1, 2, 3, ... A producer_id of 0
-  // turns this off. See PublishAck for the error codes.
+  // payloads are stored together, as one unit: all of them or none. Each
+  // must be a JSON object, and is stored as-is.
+  repeated bytes payloads = 4;
+  // producer_id and first_sequence let the broker drop retried records.
+  // Sequences count a producer's records on one shard: 1, 2, 3, ...
+  // first_sequence is that of payloads[0]; the others follow it. A
+  // producer_id of 0 turns this off. A shard only remembers its most recent
+  // producers, and accepts any first sequence from others. See PublishAck for
+  // the error codes.
   uint64 producer_id = 5;
-  uint64 sequence = 6;
+  uint64 first_sequence = 6;
 }
 
 message PublishAck {
   uint64 request_id = 1;
   int32 shard = 2;
-  // event_id is the record's position in its shard (0, 1, 2, ...).
-  // Only set when error_code is 0.
-  uint64 event_id = 3;
+  // first_event_id is the position in its shard (0, 1, 2, ...) of the first
+  // record stored; the others follow it. Only set when count isn't 0.
+  uint64 first_event_id = 3;
   // error_code is a gRPC status code (google.golang.org/grpc/codes);
-  // 0 (OK) means the record is stored on disk. ALREADY_EXISTS means it was
-  // stored by an earlier attempt. FAILED_PRECONDITION means an earlier
-  // sequence is missing: resend from the first record not yet acked.
+  // 0 (OK) means the records are stored on disk. ALREADY_EXISTS means every
+  // one was stored by an earlier attempt. FAILED_PRECONDITION means an
+  // earlier sequence is missing: resend from the first request not yet acked.
   int32 error_code = 4;
   string error_message = 5;
+  // count is how many records were added. It's lower than the request's if
+  // some of them were stored by an earlier attempt.
+  uint32 count = 6;
 }
 
 message SubscribeRequest {

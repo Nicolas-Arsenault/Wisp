@@ -3,12 +3,13 @@ package shards
 import (
 	"bufio"
 	"bytes"
-	"compress/zlib"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
+
+	"github.com/klauspost/compress/s2"
 )
 
 // A frame is one record in the .log (big-endian):
@@ -16,7 +17,7 @@ import (
 //	[4 B body length][8 B event id][8 B timestamp ms][8 B producer id]
 //	[8 B sequence][4 B CRC-32C][body]
 //
-// body is the zlib-compressed payload. The CRC covers everything but itself.
+// body is the S2-compressed payload. The CRC covers everything but itself.
 // A producer id of 0 means the record has no sequence.
 const (
 	frameHeaderSize = 40
@@ -51,25 +52,12 @@ func ValidatePayload(payload []byte) error {
 	return nil
 }
 
-func compress(payload []byte) ([]byte, error) {
-	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
-	if _, err := w.Write(payload); err != nil {
-		return nil, err
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	return b.Bytes(), nil
+func compress(payload []byte) []byte {
+	return s2.Encode(nil, payload)
 }
 
 func decompress(body []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrCorruptRecord, err)
-	}
-	defer r.Close()
-	payload, err := io.ReadAll(r)
+	payload, err := s2.Decode(nil, body)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCorruptRecord, err)
 	}

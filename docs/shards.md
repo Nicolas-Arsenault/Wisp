@@ -16,7 +16,7 @@ Each shard has two files in `<dataDir>/<topic>/`:
 A frame in the `.log` (big-endian):
 
 ```
-[4 B body length][8 B event id][8 B timestamp ms][8 B producer id][8 B sequence][4 B CRC-32C][body = zlib(payload)]
+[4 B body length][8 B event id][8 B timestamp ms][8 B producer id][8 B sequence][4 B CRC-32C][body = S2(payload)]
 ```
 
 - **Event id:** the record's position in the shard: 0, 1, 2, … It is the consumer's offset.
@@ -32,17 +32,18 @@ A frame in the `.log` (big-endian):
   1. Binary-searches the index (mmapped) for the last entry ≤ 350, here 300.
   2. Reads the `.log` forward from 300's byte position, skipping 300 to 349 (at most about 4 KB).
   3. Starts sending from 350.
-- **Fixed size:** a new `.index` is created at 1 Mi entries (16 MiB, sparse on disk), which covers about 4 GiB of `.log`. It **never grows**. When it's full, records that would need a new entry are refused with `ErrShardFull` (the producer gets `RESOURCE_EXHAUSTED`).
+- **Size:** a new `.index` has 1 Mi entries (16 MiB, sparse on disk), which covers about 4 GiB of `.log`. When it's full, the writer doubles the file and maps it again. Readers take no lock: they keep using the old mapping until they load the new one, and old mappings stay open until the shard closes. Records are only refused with `ErrShardFull` (the producer gets `RESOURCE_EXHAUSTED`) if the index can't grow, e.g. the disk is full.
 - **Current offset:** found at startup by reading the `.log` from the last index entry to the end, so ids continue after a restart. There is no in-memory sequence map.
 
 ## Writer and queue
 
 - **One writer per shard:** a goroutine is the only one writing the shard's files, so there are no locks.
-- **Bounded queue:** `Enqueue` puts records on a channel of 1024. When it's full, `Enqueue` blocks, which slows the producer down (backpressure).
-- **Batching:** the writer takes everything waiting in the queue (up to 8 MiB), writes it in one write, calls `fsync` once, then updates the index.
+- **Bounded queue:** `EnqueueBatch` puts requests on a channel of 1024. When it's full, it blocks, which slows the producer down (backpressure).
+- **Batching:** a producer's request is one item on the queue, stored whole. The writer takes everything waiting in the queue (up to 8 MiB), writes it in one write, calls `fsync` once, then updates the index. This is what makes publishing fast: many records share each `fsync`.
 - **Durability:** a record is acked only after its `fsync`. The index isn't fsynced; it can be rebuilt from the `.log`.
-- **Duplicates:** for records with a producer id, the writer keeps each producer's last sequence in memory. `EnqueueFrom` records whose sequence isn't the next one aren't stored: `Wait` returns `ErrDuplicate` if it's lower and `ErrOutOfOrder` if it's higher. A sequence only counts once its record is stored, so a failed write can be retried.
-- **Readers:** `ReadFrom` and `Wait` never block the writer. They only see records up to the committed count, which the writer sets (atomically) after the write.
+- **Duplicates:** for records with a producer id, the writer keeps each producer's last sequence in memory. A request whose records are all stored gets `ErrDuplicate`, a partly stored one keeps only its new records, and one that leaves a gap gets `ErrOutOfOrder`. A sequence only counts once its record is stored, so a failed write can be retried. The first sequence of a producer the shard doesn't remember is accepted, whatever it is. After a failed write, the shard remembers the producers it didn't know, so their later records wait for the resend.
+- **Cursors:** `Read` takes a `Cursor` and returns the next one, which knows its position in the `.log`, so a consumer that keeps reading skips the index search. `ReadFrom` is `Read` from a new cursor.
+- **Readers:** `Read`, `ReadFrom` and `Wait` never block the writer. They only see records up to the committed count, which the writer sets (atomically) after the write.
 
 ## Recovery
 
@@ -56,7 +57,7 @@ At startup, each shard checks its `.index` against its `.log`. The `.log` is the
 ## Limits
 
 - Unix only (macOS, Linux), because of mmap.
-- About 4 GiB of `.log` per shard (1 Mi index entries); no segments or growth yet.
+- One `.log` per shard, with no segments or retention: a shard is limited by disk space, and old records are never deleted.
 - Startup time grows with the size of the `.log`, because it's read in full.
-- Each producer id stays in memory for as long as the shard exists. Each producer run adds one entry per shard it writes to.
+- Each shard remembers its 1024 most recently active producers (`maxProducers`). A forgotten producer can carry on, but a retry of one of its stored records is no longer caught and is stored twice. This takes 1024 other active producers on the shard since its last record. Producer ids are reused between runs, so repeated runs from one machine count as one.
 - Old data from before this format isn't supported. Delete `../data` before upgrading.

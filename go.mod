@@ -3,6 +3,7 @@ module wisp
 go 1.26.5
 
 require (
+	github.com/klauspost/compress v1.20.3
 	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12

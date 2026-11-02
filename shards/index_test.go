@@ -21,9 +21,7 @@ func openTestIndex(t *testing.T, path string) *index {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if x.data != nil {
-			x.close()
-		}
+		x.close()
 	})
 	return x
 }
@@ -112,5 +110,38 @@ func TestOpenIndexRejectsBadSize(t *testing.T) {
 	}
 	if _, err := openIndex(path); err == nil {
 		t.Error("openIndex accepted a 17-byte file")
+	}
+}
+
+// grow keeps the entries, and a mapping taken before it stays readable.
+func TestIndexGrow(t *testing.T) {
+	useIndexCapacity(t, 2)
+	path := filepath.Join(t.TempDir(), "0.index")
+	x := openTestIndex(t, path)
+	x.set(1, 10, 4096)
+	before := *x.data.Load()
+
+	if err := x.grow(); err != nil {
+		t.Fatal(err)
+	}
+	if x.capacity != 4 {
+		t.Errorf("capacity = %d, want 4", x.capacity)
+	}
+	x.set(3, 30, 8192)
+	if id, _ := x.entry(1); id != 10 {
+		t.Errorf("entry(1) after grow = %d, want 10", id)
+	}
+	if len(before) != 2*indexEntrySize || before[indexEntrySize+7] != 10 {
+		t.Errorf("old mapping lost entry 1: % x", before)
+	}
+	if err := x.close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 4*indexEntrySize {
+		t.Errorf("file size = %d, want %d", info.Size(), 4*indexEntrySize)
 	}
 }

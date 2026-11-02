@@ -26,7 +26,7 @@ const (
 	listenAddr = ":50051"
 	dataDir    = "../data"
 
-	publishWindow   = 256            // acks a producer can wait for before we stop reading its stream
+	publishWindow   = 256            // batches a producer can wait for before we stop reading its stream
 	defaultMaxBytes = 1 << 20        // batch size when the consumer sends max_bytes = 0
 	maxMaxBytes     = 4<<20 - 64<<10 // gRPC clients refuse messages over 4 MiB
 )
@@ -59,9 +59,9 @@ type pendingAck struct {
 	pending *shards.Pending // nil if the request already failed
 }
 
-// Publish serves one producer. Each request goes on the queue of the shard
-// it names, in order, and gets one ack once stored. A bad request gets an
-// error ack and the stream stays open.
+// Publish serves one producer. Each request, a batch of records, goes on the
+// queue of the shard it names, in order, and gets one ack once stored. A bad
+// request gets an error ack and the stream stays open.
 func (s *Server) Publish(srv pb.EventBroker_PublishServer) error {
 	acks := make(chan pendingAck, publishWindow)
 	sendDone := make(chan error, 1)
@@ -114,7 +114,7 @@ func (s *Server) enqueue(ctx context.Context, req *pb.PublishRequest) (*shards.P
 	if shard < 0 || int(shard) >= len(topicShards) {
 		return nil, fmt.Errorf("%w: %d (topic has %d)", errBadShard, shard, len(topicShards))
 	}
-	return topicShards[shard].EnqueueFrom(ctx, req.GetPayload(), req.GetProducerId(), req.GetSequence())
+	return topicShards[shard].EnqueueBatch(ctx, req.GetPayloads(), req.GetProducerId(), req.GetFirstSequence())
 }
 
 // sendAcks sends acks in request order. After a send error it keeps
@@ -123,11 +123,12 @@ func sendAcks(srv pb.EventBroker_PublishServer, acks <-chan pendingAck) error {
 	var sendErr error
 	for a := range acks {
 		if a.pending != nil {
-			id, err := a.pending.Wait()
+			id, count, err := a.pending.WaitBatch()
 			if err != nil {
 				setAckError(a.ack, err)
 			}
-			a.ack.EventId = id
+			a.ack.FirstEventId = id
+			a.ack.Count = uint32(count)
 		}
 		if sendErr == nil {
 			sendErr = srv.Send(a.ack)
@@ -173,21 +174,23 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 	shard := topicShards[req.GetShard()]
 	maxBytes := fetchSize(req.GetMaxBytes())
 
-	next, err := s.startID(req, shard)
+	start, err := s.startID(req, shard)
 	if err != nil {
 		return err
 	}
+	cursor := shards.Cursor{Next: start}
 
-	slog.Info("consumer subscribed", "topic", req.GetTopic(), "shard", req.GetShard(), "start_id", next)
+	slog.Info("consumer subscribed", "topic", req.GetTopic(), "shard", req.GetShard(), "start_id", start)
 	ctx := srv.Context()
 	for {
-		records, err := shard.ReadFrom(next, maxBytes)
+		records, next, err := shard.Read(cursor, maxBytes)
 		if err != nil {
 			slog.Error("could not read shard", "topic", req.GetTopic(), "shard", req.GetShard(), "err", err)
-			return status.Errorf(codes.Internal, "could not read event %d: %v", next, err)
+			return status.Errorf(codes.Internal, "could not read event %d: %v", cursor.Next, err)
 		}
+		cursor = next
 		if len(records) == 0 {
-			if err := shard.Wait(ctx, next); err != nil {
+			if err := shard.Wait(ctx, cursor.Next); err != nil {
 				if errors.Is(err, shards.ErrShardClosed) {
 					return status.Error(codes.Unavailable, "broker is shutting down")
 				}
@@ -196,14 +199,13 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 			continue
 		}
 
-		batch := &pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard()}
-		for _, r := range records {
-			batch.Events = append(batch.Events, &pb.Event{EventId: r.ID, Payload: r.Payload, Timestamp: r.Timestamp})
+		batch := &pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard(), Events: make([]*pb.Event, len(records))}
+		for i, r := range records {
+			batch.Events[i] = &pb.Event{EventId: r.ID, Payload: r.Payload, Timestamp: r.Timestamp}
 		}
 		if err := srv.Send(batch); err != nil {
 			return err
 		}
-		next = records[len(records)-1].ID + 1
 	}
 }
 

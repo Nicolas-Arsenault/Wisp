@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -126,7 +127,9 @@ func newClient(t *testing.T, broker pb.EventBrokerServer) pb.EventBrokerClient {
 type lineWriter struct{ lines chan string }
 
 func (w lineWriter) Write(p []byte) (int, error) {
-	w.lines <- strings.TrimSuffix(string(p), "\n")
+	for _, line := range strings.Split(strings.TrimSuffix(string(p), "\n"), "\n") {
+		w.lines <- line
+	}
 	return len(p), nil
 }
 
@@ -285,8 +288,8 @@ func TestRunReturnsWriteError(t *testing.T) {
 	}
 }
 
-// A batch is committed once, after its last event is printed, with the
-// generation of the latest assignment.
+// Offsets are committed on a timer, once per shard, after the output is
+// written, with the generation of the latest assignment.
 func TestRunCommitsAfterPrintingBatch(t *testing.T) {
 	broker := newFakeBroker()
 	broker.twoEvents = true
@@ -304,10 +307,86 @@ func TestRunCommitsAfterPrintingBatch(t *testing.T) {
 		t.Errorf("commit = %v", c)
 	}
 	if len(broker.commits) != 0 {
-		t.Errorf("%d more commits, want one per batch", len(broker.commits))
+		t.Errorf("%d more commits, want one", len(broker.commits))
 	}
 	cancel()
 	waitFor(t, done, "run to return")
+	if len(broker.commits) != 0 {
+		t.Errorf("committed again with nothing new: %v", <-broker.commits)
+	}
+}
+
+// Stopping commits what was printed since the last timer, while still a
+// member, so that a restart doesn't print it again.
+func TestRunCommitsWhenStopping(t *testing.T) {
+	old := commitInterval
+	commitInterval = time.Hour
+	t.Cleanup(func() { commitInterval = old })
+
+	broker := newFakeBroker()
+	out := lineWriter{lines: make(chan string, 10)}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := start(t, ctx, broker, testOpts, out)
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{0}}
+	waitFor(t, out.lines, "event")
+
+	cancel()
+	if r := waitFor(t, done, "run to return"); r.err != nil {
+		t.Fatal(r.err)
+	}
+	if c := waitFor(t, broker.commits, "last commit"); c.GetNextId() != 1 {
+		t.Errorf("commit = %v, want next id 1", c)
+	}
+}
+
+// An offset is never committed before its lines are written: a crash would
+// then skip them.
+func TestPrinterCommitsOnlyFlushedLines(t *testing.T) {
+	var out strings.Builder
+	var seen []string
+	p := &printer{out: bufio.NewWriter(&out), offsets: make(map[int32]uint64), stop: func() {}}
+	p.commit = func(int32, uint64) { seen = append(seen, out.String()) }
+
+	p.print(line{text: "a", shard: 0, commit: 1})
+	if out.Len() != 0 {
+		t.Fatal("the line wasn't buffered")
+	}
+	p.commitAll()
+	if len(seen) != 1 || seen[0] != "a\n" {
+		t.Errorf("output at commit time = %q, want the line", seen)
+	}
+}
+
+// A failed flush commits nothing.
+func TestPrinterNoCommitAfterFailedFlush(t *testing.T) {
+	commits := 0
+	stopped := false
+	p := &printer{
+		out:     bufio.NewWriter(failingWriter{}),
+		offsets: make(map[int32]uint64),
+		commit:  func(int32, uint64) { commits++ },
+		stop:    func() { stopped = true },
+	}
+	p.print(line{text: "a", commit: 1})
+	p.commitAll()
+	if commits != 0 || !stopped || p.err == nil || p.printed != 0 {
+		t.Errorf("commits = %d, stopped = %v, err = %v, printed = %d", commits, stopped, p.err, p.printed)
+	}
+}
+
+// Each shard is committed at its newest offset.
+func TestPrinterKeepsNewestOffset(t *testing.T) {
+	var out strings.Builder
+	got := map[int32]uint64{}
+	p := &printer{out: bufio.NewWriter(&out), offsets: make(map[int32]uint64), stop: func() {}}
+	p.commit = func(shard int32, next uint64) { got[shard] = next }
+	p.print(line{text: "a", shard: 0, commit: 3})
+	p.print(line{text: "b", shard: 1, commit: 8})
+	p.print(line{text: "c", shard: 0, commit: 5})
+	p.commitAll()
+	if got[0] != 5 || got[1] != 8 || len(got) != 2 {
+		t.Errorf("committed %v", got)
+	}
 }
 
 // Nothing printed means nothing committed.

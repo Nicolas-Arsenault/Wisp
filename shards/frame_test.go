@@ -47,11 +47,7 @@ func TestValidatePayload(t *testing.T) {
 
 func TestCompressRoundTrip(t *testing.T) {
 	for _, in := range [][]byte{{}, []byte(`{"a":1}`), bytes.Repeat([]byte("x"), 100_000)} {
-		body, err := compress(in)
-		if err != nil {
-			t.Fatal(err)
-		}
-		out, err := decompress(body)
+		out, err := decompress(compress(in))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +58,7 @@ func TestCompressRoundTrip(t *testing.T) {
 }
 
 func TestDecompressRejectsGarbage(t *testing.T) {
-	if _, err := decompress([]byte("not zlib")); !errors.Is(err, ErrCorruptRecord) {
+	if _, err := decompress([]byte("not s2 data")); !errors.Is(err, ErrCorruptRecord) {
 		t.Errorf("err = %v, want ErrCorruptRecord", err)
 	}
 }

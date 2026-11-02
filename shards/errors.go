@@ -10,7 +10,7 @@ import (
 var (
 	ErrInvalidPayload = errors.New("shards: payload must be a JSON object")
 	ErrCorruptRecord  = errors.New("shards: corrupt record data")
-	ErrShardFull      = errors.New("shards: shard index is full")
+	ErrShardFull      = errors.New("shards: shard index is full and can't grow")
 	ErrShardClosed    = errors.New("shards: shard is closed")
 	ErrDuplicate      = errors.New("shards: record is already stored")
 	ErrOutOfOrder     = errors.New("shards: an earlier sequence is missing")

@@ -321,22 +321,62 @@ func TestSparseIndex(t *testing.T) {
 	}
 }
 
-func TestShardFull(t *testing.T) {
-	useIndexCapacity(t, 3)
-	useIndexInterval(t, 1)
-	s := openTestShard(t, t.TempDir())
-	for range 3 {
-		appendOK(t, s, `{}`)
+// The index grows when full: records past its first size are stored and
+// found, also after a restart.
+func TestIndexGrowsWhenFull(t *testing.T) {
+	useIndexCapacity(t, 2)
+	useIndexInterval(t, 1) // every record gets an entry
+
+	dir := t.TempDir()
+	s := openTestShard(t, dir)
+	var want []string
+	for i := range 20 {
+		want = append(want, fmt.Sprintf(`{"n":%d}`, i))
+		appendOK(t, s, want[i])
 	}
-	if _, err := s.Append(t.Context(), []byte(`{}`)); !errors.Is(err, ErrShardFull) {
-		t.Errorf("err = %v, want ErrShardFull", err)
+	if s.idx.capacity < 20 {
+		t.Errorf("capacity = %d, want at least 20", s.idx.capacity)
 	}
-	if s.NextID() != 3 {
-		t.Errorf("NextID = %d, want 3", s.NextID())
+	if got := readAll(t, s, 15); !equal(got, want[15:]) {
+		t.Errorf("read %v, want %v", got, want[15:])
+	}
+	s.Close()
+
+	s = openTestShard(t, dir)
+	if got := readAll(t, s, 0); !equal(got, want) {
+		t.Errorf("after reopen read %v, want %v", got, want)
 	}
 }
 
-// shardFiles returns the .log and .index paths of shard 0 of topic "t".
+// Readers keep working while the writer grows the index.
+func TestReadWhileIndexGrows(t *testing.T) {
+	useIndexCapacity(t, 2)
+	useIndexInterval(t, 1)
+
+	s := openTestShard(t, t.TempDir())
+	appendOK(t, s, `{}`)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if _, err := s.ReadFrom(s.NextID()/2, 1024); err != nil {
+				t.Errorf("ReadFrom: %v", err)
+				return
+			}
+		}
+	})
+	for range 200 {
+		appendOK(t, s, `{}`)
+	}
+	close(done)
+	wg.Wait()
+}
+
 func shardFiles(dir string) (logPath, indexPath string) {
 	base := filepath.Join(dir, "t", "0")
 	return base + LogExt, base + IndexExt
@@ -450,11 +490,7 @@ func TestRecoverIndexAheadOfLog(t *testing.T) {
 
 func mustCompress(t *testing.T, payload string) []byte {
 	t.Helper()
-	b, err := compress([]byte(payload))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
+	return compress([]byte(payload))
 }
 
 // A retry of a stored record is dropped, and a gap is refused, also after a
@@ -464,7 +500,7 @@ func TestSequencesDropRetries(t *testing.T) {
 	s := openTestShard(t, dir)
 	enqueue := func(s *Shard, producer, sequence uint64) (uint64, error) {
 		t.Helper()
-		p, err := s.EnqueueFrom(t.Context(), []byte(`{}`), producer, sequence)
+		p, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`)}, producer, sequence)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -499,26 +535,117 @@ func TestSequencesDropRetries(t *testing.T) {
 	}
 }
 
+// Memory is bounded: past maxProducers, the producer that wrote least
+// recently is forgotten, also when rebuilding from the log.
+func TestProducersAreBounded(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	for i := range uint64(maxProducers + 10) {
+		s.remember(i+1, 1, i)
+	}
+	if len(s.producers) != maxProducers {
+		t.Errorf("remembers %d producers, want %d", len(s.producers), maxProducers)
+	}
+	if _, ok := s.producers[1]; ok {
+		t.Error("the oldest producer is still remembered")
+	}
+	if _, ok := s.producers[maxProducers+10]; !ok {
+		t.Error("the newest producer was forgotten")
+	}
+}
+
+// An active producer stays remembered, however early it first wrote.
+func TestActiveProducerIsKept(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	event := uint64(0)
+	for i := range uint64(maxProducers * 2) {
+		s.remember(i+100, 1, event)
+		event++
+		s.remember(7, i+1, event)
+		event++
+	}
+	if r, ok := s.producers[7]; !ok || r.sequence != maxProducers*2 {
+		t.Errorf("active producer = %+v, %v", r, ok)
+	}
+}
+
+// A forgotten producer can carry on, wherever its sequence is.
+func TestForgottenProducerCarriesOn(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	p, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`)}, 7, 501)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Wait(); err != nil {
+		t.Errorf("first sequence of an unknown producer: %v", err)
+	}
+}
+
 // Records queued together are checked against each other, not just against
 // what is already on disk.
 func TestSequencesInOneBatch(t *testing.T) {
 	s := openTestShard(t, t.TempDir())
 	done := func() chan appendResult { return make(chan appendResult, 1) }
+	one := [][]byte{{}}
 	batch := []appendRequest{
-		{producer: 7, sequence: 1, done: done()},
-		{producer: 7, sequence: 1, done: done()},
-		{producer: 7, sequence: 3, done: done()},
-		{producer: 7, sequence: 2, done: done()},
+		{bodies: one, producer: 7, sequence: 1, done: done()},
+		{bodies: one, producer: 7, sequence: 1, done: done()},
+		{bodies: one, producer: 7, sequence: 3, done: done()},
+		{bodies: one, producer: 7, sequence: 2, done: done()},
 	}
+	repeat, gap := batch[1].done, batch[2].done
 	kept := s.checkSequences(batch)
 	if len(kept) != 2 || kept[0].sequence != 1 || kept[1].sequence != 2 {
 		t.Errorf("kept %+v, want sequences 1 and 2", kept)
 	}
-	if r := <-batch[1].done; !errors.Is(r.err, ErrDuplicate) {
+	if r := <-repeat; !errors.Is(r.err, ErrDuplicate) {
 		t.Errorf("repeat err = %v, want ErrDuplicate", r.err)
 	}
-	if r := <-batch[2].done; !errors.Is(r.err, ErrOutOfOrder) {
+	if r := <-gap; !errors.Is(r.err, ErrOutOfOrder) {
 		t.Errorf("gap err = %v, want ErrOutOfOrder", r.err)
+	}
+}
+
+// A batch is stored whole, in order, with consecutive sequences.
+func TestEnqueueBatch(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestShard(t, dir)
+	p, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{"n":0}`), []byte(`{"n":1}`), []byte(`{"n":2}`)}, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, count, err := p.WaitBatch(); id != 0 || count != 3 || err != nil {
+		t.Fatalf("WaitBatch = %d, %d, %v", id, count, err)
+	}
+	if got := readAll(t, s, 0); !equal(got, []string{`{"n":0}`, `{"n":1}`, `{"n":2}`}) {
+		t.Errorf("read %v", got)
+	}
+
+	// Sequences 3 and 4 overlap: only 4 is new. It survives a restart.
+	p, err = s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{"n":2}`), []byte(`{"n":3}`)}, 7, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, count, err := p.WaitBatch(); id != 3 || count != 1 || err != nil {
+		t.Errorf("partly old batch = %d, %d, %v, want 3, 1, nil", id, count, err)
+	}
+	s.Close()
+	s = openTestShard(t, dir)
+	if r := s.producers[7]; r.sequence != 4 {
+		t.Errorf("last sequence after restart = %d, want 4", r.sequence)
+	}
+}
+
+// One invalid payload rejects the batch, and nothing is stored.
+func TestEnqueueBatchRejectsWhole(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	if _, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`), []byte(`x`)}, 0, 0); !errors.Is(err, ErrInvalidPayload) {
+		t.Errorf("err = %v, want ErrInvalidPayload", err)
+	}
+	if _, err := s.EnqueueBatch(t.Context(), nil, 0, 0); !errors.Is(err, ErrInvalidPayload) {
+		t.Errorf("empty batch err = %v, want ErrInvalidPayload", err)
+	}
+	if s.NextID() != 0 {
+		t.Errorf("stored %d records", s.NextID())
 	}
 }
 
@@ -534,18 +661,39 @@ func TestFailedWriteKeepsSequence(t *testing.T) {
 	defer bad.Close()
 	s.log = bad
 	r := make(chan appendResult, 1)
-	s.commit([]appendRequest{{body: []byte("x"), producer: 7, sequence: 1, done: r}})
+	s.commit([]appendRequest{{bodies: [][]byte{[]byte("x")}, producer: 7, sequence: 1, done: r}})
 	s.log = good
 	if res := <-r; res.err == nil {
 		t.Fatal("write to a read-only file succeeded")
 	}
 
-	p, err := s.EnqueueFrom(t.Context(), []byte(`{}`), 7, 1)
+	p, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`)}, 7, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.Wait(); err != nil {
 		t.Errorf("retry err = %v, want it stored", err)
+	}
+}
+
+// After a failed write, a producer the shard didn't know can't skip past the
+// failed record: the resend would then be dropped as a duplicate.
+func TestFailedWriteHoldsLaterSequences(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	s.holdSequences([]appendRequest{{bodies: [][]byte{{}}, producer: 7, sequence: 5}, {bodies: [][]byte{{}}, producer: 7, sequence: 6}}, 0)
+
+	p, err := s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`)}, 7, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Wait(); !errors.Is(err, ErrOutOfOrder) {
+		t.Errorf("later record err = %v, want ErrOutOfOrder", err)
+	}
+	if p, err = s.EnqueueBatch(t.Context(), [][]byte{[]byte(`{}`)}, 7, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Wait(); err != nil {
+		t.Errorf("resend err = %v, want it stored", err)
 	}
 }
 
@@ -580,4 +728,52 @@ func randomBytes(t *testing.T, n int) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// A cursor reads the same records as ReadFrom, without gaps, whatever the
+// batch size, and picks up records stored later.
+func TestReadCursor(t *testing.T) {
+	useIndexInterval(t, 64)
+	s := openTestShard(t, t.TempDir())
+	var want []string
+	add := func(n int) {
+		for range n {
+			want = append(want, fmt.Sprintf(`{"n":%d}`, len(want)))
+			appendOK(t, s, want[len(want)-1])
+		}
+	}
+	add(50)
+
+	for _, maxBytes := range []int{1, 20, 45, 1 << 20} {
+		cursor := Cursor{Next: 7}
+		var got []string
+		for {
+			records, next, err := s.Read(cursor, maxBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) == 0 {
+				break
+			}
+			for _, r := range records {
+				got = append(got, string(r.Payload))
+			}
+			cursor = next
+		}
+		if !equal(got, want[7:]) {
+			t.Errorf("maxBytes %d: read %v", maxBytes, got)
+		}
+	}
+
+	cursor := Cursor{}
+	if _, c, err := s.Read(cursor, 1<<20); err != nil {
+		t.Fatal(err)
+	} else {
+		cursor = c
+	}
+	add(3)
+	records, _, err := s.Read(cursor, 1<<20)
+	if err != nil || len(records) != 3 || string(records[0].Payload) != want[50] {
+		t.Errorf("after new records: %v, %v", records, err)
+	}
 }

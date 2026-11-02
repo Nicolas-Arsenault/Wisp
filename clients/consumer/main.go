@@ -3,9 +3,10 @@
 // group, the broker splits the shards again and this consumer follows its new
 // assignment.
 //
-// After printing a batch it commits its offset to the broker, so the group
-// resumes there, whoever reads the shard next. A record can be printed twice
-// (crash or rebalance before the commit) but is never skipped.
+// Every second, and when it stops, it commits what it has printed to the
+// broker, so the group resumes there, whoever reads the shard next. A record
+// can be printed twice (crash or rebalance before a commit, up to a second of
+// records) but is never skipped.
 //
 // Output (tab separated, on stdout; logs go to stderr):
 //
@@ -20,6 +21,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -50,6 +52,14 @@ const timeLayout = "2006-01-02T15:04:05.000Z07:00"
 // defaultGroup is the group consumers share unless they name another.
 const defaultGroup = "default"
 
+const (
+	outBuffer     = 64 << 10 // bytes of output written at once
+	commitTimeout = 2 * time.Second
+)
+
+// commitInterval is how often offsets are committed. Tests shorten it.
+var commitInterval = time.Second
+
 type options struct {
 	topic    string
 	id       string // consumer id, unique in the group
@@ -60,7 +70,7 @@ type options struct {
 }
 
 // line is one output line. If commit isn't 0, it ends a batch, and commit is
-// the shard's offset once it's printed.
+// the shard's offset once it's written out.
 type line struct {
 	text   string
 	shard  int32
@@ -111,7 +121,7 @@ func main() {
 // run joins the group and, for each assignment, reads the assigned shards
 // (one Subscribe per shard) and stops reading the others. Every event is
 // printed to out by one goroutine, so lines never mix, and that goroutine
-// commits each batch once it's printed. It returns how many events it printed.
+// commits offsets. It returns how many events it printed.
 //
 // Ctrl+C (ctx cancelled) and the broker ending the stream return nil. Any
 // other error, from Join, a shard or out, stops run and is returned.
@@ -119,30 +129,46 @@ func run(parent context.Context, client pb.EventBrokerClient, opts options, out 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	join, err := client.Join(ctx, &pb.JoinRequest{Topic: opts.topic, ConsumerId: opts.id, Group: opts.group})
+	// Membership outlives ctx: a commit is refused once the consumer has left,
+	// so the last one must happen first.
+	memberCtx, leave := context.WithCancel(context.WithoutCancel(parent))
+	defer leave()
+	stopWatch := context.AfterFunc(ctx, leave) // Ctrl+C while joining
+	join, err := client.Join(memberCtx, &pb.JoinRequest{Topic: opts.topic, ConsumerId: opts.id, Group: opts.group})
+	stopWatch()
 	if err != nil {
 		return 0, fmt.Errorf("join %q: %w", opts.topic, err)
 	}
 
 	var generation atomic.Uint64 // of the latest assignment
 	lines := make(chan line, 64)
-	printed := 0
-	var printErr error
+	p := &printer{
+		out:     bufio.NewWriterSize(out, outBuffer),
+		offsets: make(map[int32]uint64),
+		commit: func(shard int32, next uint64) {
+			commit(memberCtx, client, opts, generation.Load(), shard, next)
+		},
+		stop: cancel,
+	}
 	printDone := make(chan struct{})
 	go func() {
 		defer close(printDone)
-		for l := range lines {
-			if printErr != nil {
-				continue // keep draining so readers never block
+		p.run(lines)
+	}()
+
+	assignments := make(chan *pb.Assignment)
+	joinEnded := make(chan error, 1)
+	go func() {
+		for {
+			a, err := join.Recv()
+			if err != nil {
+				joinEnded <- err
+				return
 			}
-			if _, err := fmt.Fprintln(out, l.text); err != nil {
-				printErr = fmt.Errorf("write event: %w", err)
-				cancel()
-				continue
-			}
-			printed++
-			if l.commit != 0 {
-				commit(ctx, client, opts, generation.Load(), l)
+			select {
+			case assignments <- a:
+			case <-memberCtx.Done():
+				return
 			}
 		}
 	}()
@@ -151,37 +177,40 @@ func run(parent context.Context, client pb.EventBrokerClient, opts options, out 
 	shardErr := make(chan error, 1)
 	readers := make(map[int32]context.CancelFunc) // shard -> stop reading it
 	var joinErr error
+loop:
 	for {
-		a, err := join.Recv()
-		if err != nil {
-			joinErr = err
-			break
-		}
-		slog.Info("assigned shards", "topic", opts.topic, "generation", a.GetGeneration(), "shards", a.GetShards())
-		generation.Store(a.GetGeneration())
+		select {
+		case a := <-assignments:
+			slog.Info("assigned shards", "topic", opts.topic, "generation", a.GetGeneration(), "shards", a.GetShards())
+			generation.Store(a.GetGeneration())
 
-		for shard, stop := range readers {
-			if !slices.Contains(a.GetShards(), shard) {
-				stop()
-				delete(readers, shard)
-			}
-		}
-		for _, shard := range a.GetShards() {
-			if readers[shard] != nil {
-				continue
-			}
-			shardCtx, stop := context.WithCancel(ctx)
-			readers[shard] = stop
-			wg.Go(func() {
-				err := readShard(shardCtx, client, opts, shard, lines)
-				if err != nil && shardCtx.Err() == nil {
-					select {
-					case shardErr <- err:
-					default:
-					}
-					cancel()
+			for shard, stop := range readers {
+				if !slices.Contains(a.GetShards(), shard) {
+					stop()
+					delete(readers, shard)
 				}
-			})
+			}
+			for _, shard := range a.GetShards() {
+				if readers[shard] != nil {
+					continue
+				}
+				shardCtx, stop := context.WithCancel(ctx)
+				readers[shard] = stop
+				wg.Go(func() {
+					err := readShard(shardCtx, client, opts, shard, lines)
+					if err != nil && shardCtx.Err() == nil {
+						select {
+						case shardErr <- err:
+						default:
+						}
+						cancel()
+					}
+				})
+			}
+		case joinErr = <-joinEnded:
+			break loop
+		case <-ctx.Done():
+			break loop
 		}
 	}
 
@@ -189,34 +218,114 @@ func run(parent context.Context, client pb.EventBrokerClient, opts options, out 
 	wg.Wait()
 	close(lines)
 	<-printDone
+	leave()
 
-	if printErr != nil {
-		return printed, printErr
+	if p.err != nil {
+		return p.printed, p.err
 	}
 	select {
 	case err := <-shardErr:
-		return printed, err
+		return p.printed, err
 	default:
 	}
-	if parent.Err() != nil || errors.Is(joinErr, io.EOF) {
-		return printed, nil
+	if parent.Err() != nil || joinErr == nil || errors.Is(joinErr, io.EOF) {
+		return p.printed, nil
 	}
-	return printed, fmt.Errorf("join %q: %w", opts.topic, joinErr)
+	return p.printed, fmt.Errorf("join %q: %w", opts.topic, joinErr)
 }
 
-// commit stores the offset of l. A failure isn't fatal: the records after the
-// last commit are read again, by this consumer or by the shard's next owner.
-func commit(ctx context.Context, client pb.EventBrokerClient, opts options, generation uint64, l line) {
+// printer writes lines and commits their offsets. Output is buffered, so an
+// offset is only committed after the lines before it are flushed: otherwise a
+// crash could skip records that were never written.
+type printer struct {
+	out      *bufio.Writer
+	offsets  map[int32]uint64 // shard -> offset not yet committed
+	commit   func(shard int32, next uint64)
+	stop     func() // called when out fails
+	buffered int    // lines written but not flushed
+	printed  int
+	err      error
+}
+
+// run prints lines until it's closed, then commits a last time.
+func (p *printer) run(lines <-chan line) {
+	ticker := time.NewTicker(commitInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case l, ok := <-lines:
+			if !ok {
+				p.commitAll()
+				return
+			}
+			p.print(l)
+			if len(lines) == 0 {
+				p.flush()
+			}
+		case <-ticker.C:
+			p.commitAll()
+		}
+	}
+}
+
+func (p *printer) print(l line) {
+	if p.err != nil {
+		return // keep draining so readers never block
+	}
+	if _, err := fmt.Fprintln(p.out, l.text); err != nil {
+		p.fail(err)
+		return
+	}
+	p.buffered++
+	if l.commit != 0 {
+		p.offsets[l.shard] = l.commit
+	}
+}
+
+func (p *printer) flush() {
+	if p.err != nil {
+		return
+	}
+	if err := p.out.Flush(); err != nil {
+		p.fail(err)
+		return
+	}
+	p.printed += p.buffered
+	p.buffered = 0
+}
+
+func (p *printer) fail(err error) {
+	p.err = fmt.Errorf("write event: %w", err)
+	p.stop()
+}
+
+// commitAll flushes, then commits every shard with something new.
+func (p *printer) commitAll() {
+	p.flush()
+	if p.err != nil {
+		return
+	}
+	for shard, next := range p.offsets {
+		p.commit(shard, next)
+	}
+	clear(p.offsets)
+}
+
+// commit stores one offset. A failure isn't fatal: the records after the last
+// commit are read again, by this consumer or by the shard's next owner.
+func commit(ctx context.Context, client pb.EventBrokerClient, opts options, generation uint64, shard int32, next uint64) {
+	ctx, cancel := context.WithTimeout(ctx, commitTimeout)
+	defer cancel()
 	_, err := client.Commit(ctx, &pb.CommitRequest{
 		Topic:      opts.topic,
 		Group:      opts.group,
 		ConsumerId: opts.id,
 		Generation: generation,
-		Shard:      l.shard,
-		NextId:     l.commit,
+		Shard:      shard,
+		NextId:     next,
 	})
-	if err != nil && ctx.Err() == nil {
-		slog.Warn("could not commit offset", "topic", opts.topic, "shard", l.shard, "next_id", l.commit, "err", err)
+	if err != nil {
+		slog.Warn("could not commit offset", "topic", opts.topic, "shard", shard, "next_id", next, "err", err)
 	}
 }
 
