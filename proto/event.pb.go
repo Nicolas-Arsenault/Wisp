@@ -124,13 +124,17 @@ type PublishRequest struct {
 	Topic     string `protobuf:"bytes,2,opt,name=topic,proto3" json:"topic,omitempty"`
 	// shard is hash(partition key) % num_shards, computed by the producer.
 	Shard int32 `protobuf:"varint,3,opt,name=shard,proto3" json:"shard,omitempty"`
-	// payload must be a JSON object. It is stored as-is.
-	Payload []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	// producer_id and sequence let the broker drop retried records. sequence
-	// counts a producer's records on one shard: 1, 2, 3, ... A producer_id of 0
-	// turns this off. See PublishAck for the error codes.
+	// payloads are stored together, as one unit: all of them or none. Each
+	// must be a JSON object, and is stored as-is.
+	Payloads [][]byte `protobuf:"bytes,4,rep,name=payloads,proto3" json:"payloads,omitempty"`
+	// producer_id and first_sequence let the broker drop retried records.
+	// Sequences count a producer's records on one shard: 1, 2, 3, ...
+	// first_sequence is that of payloads[0]; the others follow it. A
+	// producer_id of 0 turns this off. A shard only remembers its most recent
+	// producers, and accepts any first sequence from others. See PublishAck for
+	// the error codes.
 	ProducerId    uint64 `protobuf:"varint,5,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`
-	Sequence      uint64 `protobuf:"varint,6,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	FirstSequence uint64 `protobuf:"varint,6,opt,name=first_sequence,json=firstSequence,proto3" json:"first_sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -186,9 +190,9 @@ func (x *PublishRequest) GetShard() int32 {
 	return 0
 }
 
-func (x *PublishRequest) GetPayload() []byte {
+func (x *PublishRequest) GetPayloads() [][]byte {
 	if x != nil {
-		return x.Payload
+		return x.Payloads
 	}
 	return nil
 }
@@ -200,9 +204,9 @@ func (x *PublishRequest) GetProducerId() uint64 {
 	return 0
 }
 
-func (x *PublishRequest) GetSequence() uint64 {
+func (x *PublishRequest) GetFirstSequence() uint64 {
 	if x != nil {
-		return x.Sequence
+		return x.FirstSequence
 	}
 	return 0
 }
@@ -211,15 +215,18 @@ type PublishAck struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	RequestId uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	Shard     int32                  `protobuf:"varint,2,opt,name=shard,proto3" json:"shard,omitempty"`
-	// event_id is the record's position in its shard (0, 1, 2, ...).
-	// Only set when error_code is 0.
-	EventId uint64 `protobuf:"varint,3,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	// first_event_id is the position in its shard (0, 1, 2, ...) of the first
+	// record stored; the others follow it. Only set when count isn't 0.
+	FirstEventId uint64 `protobuf:"varint,3,opt,name=first_event_id,json=firstEventId,proto3" json:"first_event_id,omitempty"`
 	// error_code is a gRPC status code (google.golang.org/grpc/codes);
-	// 0 (OK) means the record is stored on disk. ALREADY_EXISTS means it was
-	// stored by an earlier attempt. FAILED_PRECONDITION means an earlier
-	// sequence is missing: resend from the first record not yet acked.
-	ErrorCode     int32  `protobuf:"varint,4,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
-	ErrorMessage  string `protobuf:"bytes,5,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// 0 (OK) means the records are stored on disk. ALREADY_EXISTS means every
+	// one was stored by an earlier attempt. FAILED_PRECONDITION means an
+	// earlier sequence is missing: resend from the first request not yet acked.
+	ErrorCode    int32  `protobuf:"varint,4,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage string `protobuf:"bytes,5,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// count is how many records were added. It's lower than the request's if
+	// some of them were stored by an earlier attempt.
+	Count         uint32 `protobuf:"varint,6,opt,name=count,proto3" json:"count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -268,9 +275,9 @@ func (x *PublishAck) GetShard() int32 {
 	return 0
 }
 
-func (x *PublishAck) GetEventId() uint64 {
+func (x *PublishAck) GetFirstEventId() uint64 {
 	if x != nil {
-		return x.EventId
+		return x.FirstEventId
 	}
 	return 0
 }
@@ -287,6 +294,13 @@ func (x *PublishAck) GetErrorMessage() string {
 		return x.ErrorMessage
 	}
 	return ""
+}
+
+func (x *PublishAck) GetCount() uint32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
 }
 
 type SubscribeRequest struct {
@@ -759,25 +773,26 @@ const file_proto_event_proto_rawDesc = "" +
 	"\tTopicInfo\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1d\n" +
 	"\n" +
-	"num_shards\x18\x02 \x01(\x05R\tnumShards\"\xb2\x01\n" +
+	"num_shards\x18\x02 \x01(\x05R\tnumShards\"\xbf\x01\n" +
 	"\x0ePublishRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
 	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
-	"\x05shard\x18\x03 \x01(\x05R\x05shard\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\x12\x1f\n" +
+	"\x05shard\x18\x03 \x01(\x05R\x05shard\x12\x1a\n" +
+	"\bpayloads\x18\x04 \x03(\fR\bpayloads\x12\x1f\n" +
 	"\vproducer_id\x18\x05 \x01(\x04R\n" +
-	"producerId\x12\x1a\n" +
-	"\bsequence\x18\x06 \x01(\x04R\bsequence\"\xa0\x01\n" +
+	"producerId\x12%\n" +
+	"\x0efirst_sequence\x18\x06 \x01(\x04R\rfirstSequence\"\xc1\x01\n" +
 	"\n" +
 	"PublishAck\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
-	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +
-	"\bevent_id\x18\x03 \x01(\x04R\aeventId\x12\x1d\n" +
+	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12$\n" +
+	"\x0efirst_event_id\x18\x03 \x01(\x04R\ffirstEventId\x12\x1d\n" +
 	"\n" +
 	"error_code\x18\x04 \x01(\x05R\terrorCode\x12#\n" +
-	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\"\xa4\x01\n" +
+	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\x12\x14\n" +
+	"\x05count\x18\x06 \x01(\rR\x05count\"\xa4\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +

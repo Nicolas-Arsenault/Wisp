@@ -33,9 +33,9 @@ type EventBrokerClient interface {
 	// DescribeTopic returns how many shards a topic has, creating the topic if
 	// it doesn't exist yet. Producers call it once to hash keys to shards.
 	DescribeTopic(ctx context.Context, in *DescribeTopicRequest, opts ...grpc.CallOption) (*TopicInfo, error)
-	// Publish is a long-lived producer stream. Each request goes to the shard
-	// the producer chose; the broker answers every request with one ack, in
-	// request order.
+	// Publish is a long-lived producer stream. Each request holds records of
+	// the shard the producer chose; the broker answers every request with one
+	// ack, in request order.
 	Publish(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PublishRequest, PublishAck], error)
 	// Subscribe streams one shard from start_id (or from its end if latest is
 	// set): first every stored record, then new records as they are written.
@@ -135,9 +135,9 @@ type EventBrokerServer interface {
 	// DescribeTopic returns how many shards a topic has, creating the topic if
 	// it doesn't exist yet. Producers call it once to hash keys to shards.
 	DescribeTopic(context.Context, *DescribeTopicRequest) (*TopicInfo, error)
-	// Publish is a long-lived producer stream. Each request goes to the shard
-	// the producer chose; the broker answers every request with one ack, in
-	// request order.
+	// Publish is a long-lived producer stream. Each request holds records of
+	// the shard the producer chose; the broker answers every request with one
+	// ack, in request order.
 	Publish(grpc.BidiStreamingServer[PublishRequest, PublishAck]) error
 	// Subscribe streams one shard from start_id (or from its end if latest is
 	// set): first every stored record, then new records as they are written.

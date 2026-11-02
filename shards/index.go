@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,19 +17,22 @@ import (
 const indexEntrySize = 16
 
 // indexCapacity is the number of entries in a new .index (16 MiB, so about
-// 4 GiB of .log). The file is created at full size (sparse on disk) and never
-// grows. indexCapacity and indexInterval are variables so tests can change them.
+// 4 GiB of .log). The file is created at full size (sparse on disk) and doubles
+// when full. indexCapacity and indexInterval are variables so tests can change
+// them.
 var (
 	indexCapacity uint64 = 1 << 20
 	indexInterval int64  = 4096
 )
 
 // index is a .index file mapped in memory (mmap). Only the shard writer
-// writes to it.
+// writes to it and grows it. Readers take no lock: they use whichever mapping
+// they load, and every mapping stays valid until close.
 type index struct {
 	file     *os.File
-	data     []byte
-	capacity uint64
+	data     atomic.Pointer[[]byte]
+	old      [][]byte // earlier mappings, unmapped by close (writer only)
+	capacity uint64   // writer only
 }
 
 func openIndex(path string) (*index, error) {
@@ -58,16 +62,38 @@ func openIndex(path string) (*index, error) {
 		f.Close()
 		return nil, fmt.Errorf("shards: mmap %q: %w", path, err)
 	}
-	return &index{file: f, data: data, capacity: uint64(size) / indexEntrySize}, nil
+	x := &index{file: f, capacity: uint64(size) / indexEntrySize}
+	x.data.Store(&data)
+	return x, nil
+}
+
+// grow doubles the file and maps it again. The old mapping shows the same
+// file, so a reader still using it sees every entry it can ask for: the shard
+// publishes a new entry count only after grow returned. A failure leaves the
+// index usable at its current size.
+func (x *index) grow() error {
+	capacity := x.capacity * 2
+	size := int64(capacity * indexEntrySize)
+	if err := x.file.Truncate(size); err != nil {
+		return err
+	}
+	data, err := unix.Mmap(int(x.file.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("shards: mmap %q: %w", x.file.Name(), err)
+	}
+	x.old = append(x.old, *x.data.Load())
+	x.data.Store(&data)
+	x.capacity = capacity
+	return nil
 }
 
 func (x *index) entry(i uint64) (id uint64, pos int64) {
-	e := x.data[i*indexEntrySize:]
+	e := (*x.data.Load())[i*indexEntrySize:]
 	return binary.BigEndian.Uint64(e[0:8]), int64(binary.BigEndian.Uint64(e[8:16]))
 }
 
 func (x *index) set(i uint64, id uint64, pos int64) {
-	e := x.data[i*indexEntrySize:]
+	e := (*x.data.Load())[i*indexEntrySize:]
 	binary.BigEndian.PutUint64(e[0:8], id)
 	binary.BigEndian.PutUint64(e[8:16], uint64(pos))
 }
@@ -101,5 +127,11 @@ func (x *index) lastEntry() uint64 {
 }
 
 func (x *index) close() error {
-	return errors.Join(unix.Msync(x.data, unix.MS_SYNC), unix.Munmap(x.data), x.file.Close())
+	data := *x.data.Load()
+	errs := []error{unix.Msync(data, unix.MS_SYNC), unix.Munmap(data)}
+	for _, old := range x.old {
+		errs = append(errs, unix.Munmap(old))
+	}
+	x.old = nil
+	return errors.Join(append(errs, x.file.Close())...)
 }

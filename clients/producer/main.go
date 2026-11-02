@@ -4,8 +4,14 @@
 // with the same key go to the same shard, in order. Lines without a key take
 // turns over the shards.
 //
-// A failed stream is retried from the first record not yet acked. The broker
-// drops the ones it already has (see producer_id in event.proto).
+// Lines waiting together are sent as one batch, so the broker stores them in
+// one fsync. Each batch is saved to a local spool file before it's sent, and
+// the file is deleted once all its batches are acked (see spool.go). A failed
+// stream is retried from the first batch not acked, with growing delays, for
+// as long as the broker is unreachable. Files left by a crash are sent at the next start.
+// The broker drops what it already has (see producer_id in event.proto).
+// Producer ids are reused between runs, and the shard count is saved, so a
+// run can start and save lines with the broker down.
 //
 // Usage:
 //
@@ -17,6 +23,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,10 +31,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"os"
 	"os/signal"
-	"strings"
+	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 	"wisp/partition"
@@ -44,17 +51,20 @@ import (
 const defaultAddr = "localhost:50051"
 
 const (
-	shardBuffer = 1024 // lines waiting per shard; reading stdin blocks when full
-	maxRetries  = 5    // failed attempts in a row before giving up on a shard
+	shardBuffer   = 1024 // lines read but not yet saved, per shard
+	sendBacklog   = 1024 // saved batches waiting to be sent, per shard; reading stdin blocks when full
+	maxRetryDelay = 30 * time.Second
 )
 
-// retryDelay is the wait between attempts. Tests shorten it.
+// retryDelay is the wait after the first failure; it doubles after each
+// failure in a row, up to maxRetryDelay. Tests shorten it.
 var retryDelay = 200 * time.Millisecond
 
 func main() {
 	addr := flag.String("addr", defaultAddr, "broker address")
 	topic := flag.String("topic", "", "topic to publish to (required)")
 	keyField := flag.String("key-field", "", "JSON field whose value is the partition key (empty: lines take turns over the shards)")
+	spool := flag.String("spool", defaultSpool(), "directory for lines not yet acked; each topic has its own folder")
 	flag.Parse()
 	if *topic == "" {
 		fmt.Fprintln(os.Stderr, "producer: -topic is required")
@@ -73,7 +83,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	sent, err := run(ctx, pb.NewEventBrokerClient(conn), *topic, *keyField, os.Stdin)
+	sent, err := run(ctx, pb.NewEventBrokerClient(conn), *topic, *keyField, *spool, os.Stdin)
 	slog.Info("producer done", "topic", *topic, "published", sent)
 	if err != nil {
 		slog.Error("producer stopped", "err", err)
@@ -81,28 +91,60 @@ func main() {
 	}
 }
 
-// run publishes every non-empty line of in and returns how many were stored.
-// The request id is the line number. Lines that aren't JSON objects are
-// skipped. An error that retries can't fix stops run.
-func run(ctx context.Context, client pb.EventBrokerClient, topic, keyField string, in io.Reader) (int, error) {
-	info, err := client.DescribeTopic(ctx, &pb.DescribeTopicRequest{Topic: topic})
+// defaultSpool is in the user's cache directory, so it doesn't depend on
+// where the producer is started.
+func defaultSpool() string {
+	dir, err := os.UserCacheDir()
 	if err != nil {
-		return 0, fmt.Errorf("describe topic %q: %w", topic, err)
+		return "wisp-spool"
 	}
-	numShards := int(info.GetNumShards())
-	if numShards <= 0 {
-		return 0, fmt.Errorf("describe topic %q: broker reported %d shards", topic, numShards)
+	return filepath.Join(dir, "wisp", "spool")
+}
+
+// run publishes the records left in the spool, then every non-empty line of
+// in, and returns how many were stored. The request id is the line number.
+// Lines that aren't JSON objects are skipped. An error that retries can't fix
+// stops run; lines not acked stay in the spool for the next run.
+func run(ctx context.Context, client pb.EventBrokerClient, topic, keyField, spool string, in io.Reader) (int, error) {
+	dir := filepath.Join(spool, topic)
+	numShards, err := shardCount(ctx, client, topic, dir)
+	if err != nil {
+		return 0, err
+	}
+
+	leases, err := takeLeases(dir, numShards)
+	if err != nil {
+		return 0, err
+	}
+	senders := make([]*sender, numShards)
+	for i := range senders {
+		senders[i] = &sender{
+			client: client,
+			dir:    dir,
+			lease:  leases[0],
+			topic:  topic,
+			shard:  int32(i),
+			lines:  make(chan line, shardBuffer),
+			out:    make(chan *spooled, sendBacklog),
+		}
+	}
+	kept, err := loadSpool(dir, leases, senders)
+	defer func() { closeLeases(kept) }()
+	if err != nil {
+		return 0, err
 	}
 
 	// The first error cancels every sender and is what run returns.
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
-	senders := make([]*sender, numShards)
 	var wg sync.WaitGroup
-	for i := range senders {
-		s := &sender{client: client, in: make(chan *pb.PublishRequest, shardBuffer)}
-		senders[i] = s
+	for _, s := range senders {
+		wg.Go(func() {
+			if err := s.spoolLines(ctx); err != nil {
+				cancel(err)
+			}
+		})
 		wg.Go(func() {
 			if err := s.run(ctx); err != nil {
 				cancel(err)
@@ -110,37 +152,58 @@ func run(ctx context.Context, client pb.EventBrokerClient, topic, keyField strin
 		})
 	}
 
-	if err := sendLines(ctx, senders, topic, keyField, in); err != nil {
+	if err := sendLines(ctx, senders, leases[0], topic, keyField, in); err != nil {
 		cancel(err)
 	}
 	for _, s := range senders {
-		close(s.in)
+		close(s.lines)
 	}
 	wg.Wait()
 
 	stored := 0
 	for _, s := range senders {
 		stored += s.stored
+		s.closeFiles()
 	}
 	return stored, context.Cause(ctx)
 }
 
-// sendLines gives each valid line to the sender of its shard, numbering each
-// shard's records from 1. The id is new on every run, because the numbering
-// restarts. Invalid lines are skipped here so that they don't use up a sequence.
-func sendLines(ctx context.Context, senders []*sender, topic, keyField string, in io.Reader) error {
-	producerID := rand.Uint64() | 1 // never 0, which means no duplicate check
-	sequences := make([]uint64, len(senders))
+// shardCount returns the topic's shard count. It's saved in the spool the
+// first time, and never changes, so later runs can start with the broker down.
+func shardCount(ctx context.Context, client pb.EventBrokerClient, topic, dir string) (int, error) {
+	if n := loadShardCount(dir); n > 0 {
+		return n, nil
+	}
+	var info *pb.TopicInfo
+	err := retry(ctx, func() (bool, error) {
+		var err error
+		info, err = client.DescribeTopic(ctx, &pb.DescribeTopicRequest{Topic: topic})
+		return false, err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("describe topic %q: %w", topic, err)
+	}
+	n := int(info.GetNumShards())
+	if n <= 0 {
+		return 0, fmt.Errorf("describe topic %q: broker reported %d shards", topic, n)
+	}
+	return n, saveShardCount(dir, n)
+}
+
+// sendLines gives each valid line to the sender of its shard, continuing the
+// lease's sequences. Invalid lines are skipped here so that they don't use up
+// a sequence.
+func sendLines(ctx context.Context, senders []*sender, l *lease, topic, keyField string, in io.Reader) error {
 	nextShard := 0 // for lines without a key
 
 	scanner := bufio.NewScanner(in)
-	for line := 1; scanner.Scan(); line++ {
-		payload := []byte(strings.TrimSpace(scanner.Text()))
+	for number := uint64(1); scanner.Scan(); number++ {
+		payload := bytes.Clone(bytes.TrimSpace(scanner.Bytes()))
 		if len(payload) == 0 {
 			continue
 		}
 		if err := shards.ValidatePayload(payload); err != nil {
-			slog.Warn("invalid event, skipped", "line", line, "err", err)
+			slog.Warn("invalid event, skipped", "line", number, "err", err)
 			continue
 		}
 
@@ -150,17 +213,9 @@ func sendLines(ctx context.Context, senders []*sender, topic, keyField string, i
 		} else {
 			nextShard = (nextShard + 1) % len(senders)
 		}
-		sequences[shard]++
-		req := &pb.PublishRequest{
-			RequestId:  uint64(line),
-			Topic:      topic,
-			Shard:      int32(shard),
-			Payload:    payload,
-			ProducerId: producerID,
-			Sequence:   sequences[shard],
-		}
+		l.sequences[shard]++
 		select {
-		case senders[shard].in <- req:
+		case senders[shard].lines <- line{number, l.sequences[shard], payload}:
 		case <-ctx.Done():
 			return nil
 		}
@@ -171,51 +226,182 @@ func sendLines(ctx context.Context, senders []*sender, topic, keyField string, i
 	return nil
 }
 
+// line is one record read from stdin, not yet saved.
+type line struct {
+	number   uint64
+	sequence uint64
+	payload  []byte
+}
+
 // sender publishes the records of one shard.
 type sender struct {
 	client pb.EventBrokerClient
-	in     chan *pb.PublishRequest // closed when there are no more lines
+	dir    string
+	lease  *lease
+	topic  string
+	shard  int32
+	lines  chan line     // closed when there are no more lines
+	out    chan *spooled // saved batches to send; closed after lines
 	stored int
 
 	mu      sync.Mutex
-	unacked []*pb.PublishRequest // sent or about to be, oldest first
+	current *batch     // file being written; nil if none
+	unacked []*spooled // sent or about to be, oldest first
 }
 
-// run opens streams until in is closed and everything is acked.
-func (s *sender) run(ctx context.Context) error {
-	for failures := 1; ; failures++ {
-		before := s.stored
-		err := s.publish(ctx)
-		if err == nil || !retryable(err) || ctx.Err() != nil {
-			return err
-		}
-		if s.stored > before {
-			failures = 1
-		}
-		if failures >= maxRetries {
-			return err
-		}
-		slog.Warn("publish failed, retrying", "attempt", failures, "err", err)
+// spoolLines groups the waiting lines into requests, saves each to the spool
+// with one write, and passes it on. It doesn't wait for more lines, so a lone
+// line goes out at once and requests only grow under load. It's separate from
+// sending, so lines are saved while the broker is down.
+func (s *sender) spoolLines(ctx context.Context) error {
+	defer close(s.out)
+	for {
 		select {
-		case <-time.After(retryDelay):
+		case first, ok := <-s.lines:
+			if !ok {
+				return nil
+			}
+			record, err := s.spool(s.collect(first))
+			if err != nil {
+				return fmt.Errorf("save line %d: %w", first.number, err)
+			}
+			select {
+			case s.out <- record:
+			case <-ctx.Done():
+				return nil
+			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		}
 	}
 }
 
+// collect returns a request of first and the lines waiting behind it.
+func (s *sender) collect(first line) *pb.PublishRequest {
+	req := &pb.PublishRequest{
+		RequestId:     first.number,
+		Topic:         s.topic,
+		Shard:         s.shard,
+		Payloads:      [][]byte{first.payload},
+		ProducerId:    s.lease.id,
+		FirstSequence: first.sequence,
+	}
+	size := len(first.payload)
+	for len(req.Payloads) < maxBatchLines && size < maxBatchBytes {
+		select {
+		case next, ok := <-s.lines:
+			if !ok {
+				return req
+			}
+			req.Payloads = append(req.Payloads, next.payload)
+			size += len(next.payload)
+		default:
+			return req
+		}
+	}
+	return req
+}
+
+// spool saves req to the current file, starting a new one if needed.
+func (s *sender) spool(req *pb.PublishRequest) (*spooled, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil || s.current.full() {
+		b, err := newBatch(s.dir, s.lease, req)
+		if err != nil {
+			return nil, err
+		}
+		if s.current != nil && s.current.pending == 0 {
+			s.current.remove()
+		}
+		s.current = b
+	}
+	if err := s.current.write(req); err != nil {
+		return nil, err
+	}
+	s.current.pending++
+	return &spooled{req: req, batch: s.current}, nil
+}
+
+// acked drops the oldest request, and deletes its file if it was the last one
+// and the file is full. The file being written stays, so that a slow stream of
+// lines doesn't cost one fsync each (see batch.remove). If it's left by a
+// crash, the broker drops its acked records as duplicates.
+func (s *sender) acked() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.unacked[0].batch
+	s.unacked = s.unacked[1:]
+	b.pending--
+	if b.pending == 0 && b != s.current {
+		b.remove()
+	}
+}
+
+// closeFiles deletes the current file if it's fully acked, and releases the
+// files of requests that aren't. They stay for the next run. out must be
+// closed.
+func (s *sender) closeFiles() {
+	for record := range s.out {
+		s.unacked = append(s.unacked, record)
+	}
+	if s.current != nil && s.current.pending == 0 {
+		s.current.remove()
+	}
+	for _, record := range s.unacked {
+		record.batch.file.Close()
+	}
+}
+
+// run opens streams until out is closed and everything is acked.
+func (s *sender) run(ctx context.Context) error {
+	return retry(ctx, func() (bool, error) {
+		before := s.stored
+		err := s.publish(ctx)
+		return s.stored > before, err
+	})
+}
+
+// retry calls attempt until it succeeds, it fails with an error retries can't
+// fix, or ctx ends. attempt reports whether it made progress, which resets
+// the delay. There is no limit on attempts: the records are safe in the spool.
+func retry(ctx context.Context, attempt func() (progress bool, err error)) error {
+	delay := retryDelay
+	for {
+		progress, err := attempt()
+		if err == nil || !retryable(err) || ctx.Err() != nil {
+			return err
+		}
+		if progress {
+			delay = retryDelay
+		}
+		slog.Warn("broker call failed, retrying", "delay", delay, "err", err)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		delay = nextDelay(delay)
+	}
+}
+
+func nextDelay(delay time.Duration) time.Duration {
+	return min(delay*2, maxRetryDelay)
+}
+
 // retryable says if sending the records again can help. FailedPrecondition
-// follows an earlier failure: the resend fills the gap.
+// follows an earlier failure: the resend fills the gap. ResourceExhausted
+// means the broker is out of disk space, which someone can fix.
 func retryable(err error) bool {
 	switch status.Code(err) {
-	case codes.Unavailable, codes.Internal, codes.FailedPrecondition:
+	case codes.Unavailable, codes.Internal, codes.FailedPrecondition, codes.ResourceExhausted:
 		return true
 	}
 	return false
 }
 
-// publish runs one stream. It returns nil once in is closed and every record
-// is acked.
+// publish runs one stream. It returns nil once out is closed and every
+// request is acked.
 func (s *sender) publish(ctx context.Context) error {
 	// Cancelling streamCtx unblocks send if receiving acks fails.
 	streamCtx, cancel := context.WithCancel(ctx)
@@ -242,27 +428,27 @@ func (s *sender) publish(ctx context.Context) error {
 	return nil
 }
 
-// send resends what isn't acked, then sends new records until in is closed.
-// A record joins unacked before it's sent, so a failed send is retried.
+// send resends what isn't acked, then sends new requests until out is closed.
+// A request joins unacked before it's sent, so a failed send is retried.
 func (s *sender) send(ctx context.Context, stream pb.EventBroker_PublishClient) error {
 	s.mu.Lock()
-	resend := append([]*pb.PublishRequest{}, s.unacked...)
+	resend := slices.Clone(s.unacked)
 	s.mu.Unlock()
-	for _, req := range resend {
-		if err := stream.Send(req); err != nil {
+	for _, record := range resend {
+		if err := stream.Send(record.req); err != nil {
 			return err
 		}
 	}
 	for {
 		select {
-		case req, ok := <-s.in:
+		case record, ok := <-s.out:
 			if !ok {
 				return stream.CloseSend()
 			}
 			s.mu.Lock()
-			s.unacked = append(s.unacked, req)
+			s.unacked = append(s.unacked, record)
 			s.mu.Unlock()
-			if err := stream.Send(req); err != nil {
+			if err := stream.Send(record.req); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -271,8 +457,8 @@ func (s *sender) send(ctx context.Context, stream pb.EventBroker_PublishClient) 
 	}
 }
 
-// receiveAcks removes each stored record from unacked until the stream ends.
-// Acks come in request order, so each one is for the oldest record.
+// receiveAcks removes each stored request from unacked until the stream ends.
+// Acks come in request order, so each one is for the oldest request.
 func (s *sender) receiveAcks(stream pb.EventBroker_PublishClient) error {
 	for {
 		ack, err := stream.Recv()
@@ -286,11 +472,10 @@ func (s *sender) receiveAcks(stream pb.EventBroker_PublishClient) error {
 		if code != codes.OK && code != codes.AlreadyExists { // AlreadyExists: stored by an earlier attempt
 			return fmt.Errorf("publish line %d: %w", ack.GetRequestId(), status.Error(code, ack.GetErrorMessage()))
 		}
-		slog.Debug("event stored", "line", ack.GetRequestId(), "shard", ack.GetShard(), "event_id", ack.GetEventId())
-		s.stored++
 		s.mu.Lock()
-		s.unacked = s.unacked[1:]
+		s.stored += len(s.unacked[0].req.GetPayloads())
 		s.mu.Unlock()
+		s.acked()
 	}
 }
 
