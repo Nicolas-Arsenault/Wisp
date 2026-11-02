@@ -15,7 +15,7 @@ Returns the topic's number of shards and creates the topic if needed. Producers 
 A long-lived stream. The command-line producer opens one per shard, so a full shard only slows its own stream.
 
 - **Request:** `{request_id, topic, shard, payloads, producer_id, first_sequence}`, a batch of records. The shard is computed by the producer.
-- **Writing:** each request is put on that shard's queue, in the order received. Its records are stored together, in one fsync: all of them or none. One invalid payload rejects the request.
+- **Writing:** each request is put on that shard's queue, in the order received. Its records are stored together, in one fsync: all of them or none, except that a broker crash during the write can keep the first ones (see [shards.md](shards.md)). One invalid payload rejects the request.
 - **Ack:** each request gets one ack, in request order, once its records are on disk: `{request_id, shard, first_event_id, count}`. `count` is how many records were added.
 - **Errors:** a bad request gets an ack with `error_code` set, and the stream stays open.
 

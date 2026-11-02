@@ -40,7 +40,9 @@ A frame in the `.log` (big-endian):
 - **One writer per shard:** a goroutine is the only one writing the shard's files, so there are no locks.
 - **Bounded queue:** `EnqueueBatch` puts requests on a channel of 1024. When it's full, it blocks, which slows the producer down (backpressure).
 - **Batching:** a producer's request is one item on the queue, stored whole. The writer takes everything waiting in the queue (up to 8 MiB), writes it in one write, calls `fsync` once, then updates the index. This is what makes publishing fast: many records share each `fsync`.
-- **Durability:** a record is acked only after its `fsync`. The index isn't fsynced; it can be rebuilt from the `.log`.
+- **Durability:** a record is acked only after its `fsync`. The index isn't fsynced; it can be rebuilt from the `.log`. A new shard's directory and data directory are also fsynced before it opens, so a power cut can't lose the file of an acked record.
+- **Atomic batches:** a request's records are stored all together or not at all while the broker runs. A crash isn't covered: a torn write can keep the first records of an unacked request, because recovery cuts the `.log` at the first bad frame. Records that must stay together across a crash need their own check on the reader's side.
+- **Unacked isn't unstored:** if the broker process dies after its write and before the ack, the whole record is in the OS page cache and is found at the next start. A producer must resend it with the same sequence rather than assume it's gone.
 - **Duplicates:** for records with a producer id, the writer keeps each producer's last sequence in memory. A request whose records are all stored gets `ErrDuplicate`, a partly stored one keeps only its new records, and one that leaves a gap gets `ErrOutOfOrder`. A sequence only counts once its record is stored, so a failed write can be retried. The first sequence of a producer the shard doesn't remember is accepted, whatever it is. After a failed write, the shard remembers the producers it didn't know, so their later records wait for the resend.
 - **Cursors:** `Read` takes a `Cursor` and returns the next one, which knows its position in the `.log`, so a consumer that keeps reading skips the index search. `ReadFrom` is `Read` from a new cursor.
 - **Readers:** `Read`, `ReadFrom` and `Wait` never block the writer. They only see records up to the committed count, which the writer sets (atomically) after the write.
@@ -50,7 +52,7 @@ A frame in the `.log` (big-endian):
 At startup, each shard checks its `.index` against its `.log`. The `.log` is the source of truth:
 
 - **Missing index entries:** the `.log` is read from the last index entry to the end, and entries the index doesn't have yet (crash after the fsync) are added.
-- **Torn record:** a torn frame at the end of the `.log` (crash during a write, never acked) is cut off.
+- **Torn record:** a torn frame at the end of the `.log` (crash during a write, never acked) is cut off. Recovery can't tell this from a damaged disk: a bad frame after the last index entry is cut with everything after it, even if acked. That can remove up to about 4 KB of records.
 - **Index that doesn't match:** if the index doesn't match the `.log`, it's rebuilt from the start of the `.log`.
 - **Producer sequences:** the whole `.log` is read to find each producer's last sequence, so duplicates are still caught after a restart. A damaged record found here stops the shard from opening, and so the broker from starting.
 

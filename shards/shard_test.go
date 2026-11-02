@@ -54,6 +54,69 @@ func equal(a, b []string) bool {
 	return fmt.Sprint(a) == fmt.Sprint(b)
 }
 
+// countDirSyncs records the directories syncDir is called with, and returns
+// err from it.
+func countDirSyncs(t *testing.T, err error) *[]string {
+	t.Helper()
+	var synced []string
+	old := syncDir
+	syncDir = func(path string) error {
+		synced = append(synced, path)
+		return err
+	}
+	t.Cleanup(func() { syncDir = old })
+	return &synced
+}
+
+func TestOpenSyncsDirsOfNewShard(t *testing.T) {
+	dir := t.TempDir()
+	synced := countDirSyncs(t, nil)
+
+	s := openTestShard(t, dir)
+	want := []string{filepath.Join(dir, "t"), dir}
+	if !equal(*synced, want) {
+		t.Errorf("synced %v, want %v", *synced, want)
+	}
+	appendOK(t, s, `{"n":0}`)
+	s.Close()
+
+	*synced = nil
+	openTestShard(t, dir)
+	if len(*synced) != 0 {
+		t.Errorf("a shard with records synced %v, want nothing", *synced)
+	}
+}
+
+// A crash between creating the files and syncing the directory leaves an
+// empty log, which must be synced by the next Open.
+func TestOpenSyncsDirsOfEmptyShard(t *testing.T) {
+	dir := t.TempDir()
+	openTestShard(t, dir).Close()
+
+	synced := countDirSyncs(t, nil)
+	openTestShard(t, dir)
+	if len(*synced) != 2 {
+		t.Errorf("synced %v, want both directories", *synced)
+	}
+}
+
+func TestOpenFailsIfDirSyncFails(t *testing.T) {
+	failure := errors.New("disk gone")
+	countDirSyncs(t, failure)
+	if s, err := Open(t.TempDir(), "t", 0); !errors.Is(err, failure) {
+		if err == nil {
+			s.Close()
+		}
+		t.Errorf("Open = %v, want %v", err, failure)
+	}
+}
+
+func TestSyncDirOnRealDir(t *testing.T) {
+	if err := syncDir(t.TempDir()); err != nil {
+		t.Errorf("syncDir: %v", err)
+	}
+}
+
 func TestAppendAndReadFrom(t *testing.T) {
 	s := openTestShard(t, t.TempDir())
 	payloads := []string{`{"n":0}`, `{"b": "kept as sent"}`, `{"n":2}`}

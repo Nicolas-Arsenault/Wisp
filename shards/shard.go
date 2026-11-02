@@ -117,6 +117,11 @@ func Open(dataDir, topic string, id int) (*Shard, error) {
 	if err == nil {
 		err = s.loadProducers()
 	}
+	if err == nil && s.logEnd.Load() == 0 {
+		// A log with records was synced by the Open that came before them,
+		// so only an empty one can still be missing from its directory.
+		err = errors.Join(syncDir(dir), syncDir(dataDir))
+	}
 	if err != nil {
 		idx.close()
 		logFile.Close()
@@ -124,6 +129,18 @@ func Open(dataDir, topic string, id int) (*Shard, error) {
 	}
 	go s.run()
 	return s, nil
+}
+
+// syncDir makes the entries of a directory durable. Without it, a power cut
+// can lose a new file even though its contents were fsynced, and with it every
+// acked record. It's a variable so tests can count the calls.
+var syncDir = func(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // recover makes the .index match the .log, which is the source of truth.
