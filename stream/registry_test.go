@@ -85,3 +85,62 @@ func TestOpenRegistryMissingShard(t *testing.T) {
 		t.Error("OpenRegistry accepted a topic without shard 0")
 	}
 }
+
+// Offsets survive a restart, per topic, group and shard.
+func TestOffsets(t *testing.T) {
+	dir := t.TempDir()
+	r, err := OpenRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Topic("orders"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := r.LoadOffset("orders", "g", 1); ok || err != nil {
+		t.Fatalf("LoadOffset before any save = %v, %v", ok, err)
+	}
+	for _, next := range []uint64{5, 12} { // the last save wins
+		if err := r.SaveOffset("orders", "g", 1, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.Close()
+
+	r2 := openTestRegistry(t, dir) // the groups directory isn't taken for a shard
+	if next, ok, err := r2.LoadOffset("orders", "g", 1); next != 12 || !ok || err != nil {
+		t.Errorf("LoadOffset = %d, %v, %v, want 12", next, ok, err)
+	}
+	if _, ok, _ := r2.LoadOffset("orders", "g", 2); ok {
+		t.Error("found an offset for another shard")
+	}
+	if _, ok, _ := r2.LoadOffset("orders", "other", 1); ok {
+		t.Error("found an offset for another group")
+	}
+}
+
+func TestOffsetRejectsBadGroup(t *testing.T) {
+	r := openTestRegistry(t, t.TempDir())
+	for _, group := range []string{"", "..", "a/b"} {
+		if err := r.SaveOffset("orders", group, 0, 1); !errors.Is(err, ErrInvalidGroup) {
+			t.Errorf("SaveOffset(%q) = %v, want ErrInvalidGroup", group, err)
+		}
+		if _, _, err := r.LoadOffset("orders", group, 0); !errors.Is(err, ErrInvalidGroup) {
+			t.Errorf("LoadOffset(%q) = %v, want ErrInvalidGroup", group, err)
+		}
+	}
+}
+
+// A damaged offset counts as none, rather than stopping the group.
+func TestDamagedOffsetIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	r := openTestRegistry(t, dir)
+	if err := r.SaveOffset("orders", "g", 0, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "orders", "groups", "g", "0.offset"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := r.LoadOffset("orders", "g", 0); ok || err != nil {
+		t.Errorf("LoadOffset = %v, %v, want none", ok, err)
+	}
+}

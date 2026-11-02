@@ -243,9 +243,14 @@ func TestSubscribeErrors(t *testing.T) {
 // join opens a Join stream for consumer id on topic t. cancel leaves.
 func join(t *testing.T, client pb.EventBrokerClient, id string) (pb.EventBroker_JoinClient, context.CancelFunc) {
 	t.Helper()
+	return joinGroup(t, client, "", id)
+}
+
+func joinGroup(t *testing.T, client pb.EventBrokerClient, group, id string) (pb.EventBroker_JoinClient, context.CancelFunc) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	t.Cleanup(cancel)
-	stream, err := client.Join(ctx, &pb.JoinRequest{Topic: "t", ConsumerId: id})
+	stream, err := client.Join(ctx, &pb.JoinRequest{Topic: "t", ConsumerId: id, Group: group})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,8 +282,8 @@ func TestJoinRebalances(t *testing.T) {
 	}
 
 	b, leaveB := join(t, client, "b")
-	second := expectShards(t, a, "[0 2 4]")
-	expectShards(t, b, "[1 3]")
+	second := expectShards(t, a, "[0 1 2]")
+	expectShards(t, b, "[3 4]")
 	if second.GetGeneration() <= first.GetGeneration() {
 		t.Errorf("generation %d after %d, want it to increase", second.GetGeneration(), first.GetGeneration())
 	}
@@ -292,12 +297,13 @@ func TestJoinThreeConsumers(t *testing.T) {
 	a, _ := join(t, client, "a")
 	expectShards(t, a, "[0 1 2 3 4]")
 	b, _ := join(t, client, "b")
-	expectShards(t, a, "[0 2 4]")
-	expectShards(t, b, "[1 3]")
+	expectShards(t, a, "[0 1 2]")
+	expectShards(t, b, "[3 4]")
 
+	// Only shard 2 moves.
 	c, _ := join(t, client, "c")
-	expectShards(t, a, "[0 3]")
-	expectShards(t, b, "[1 4]")
+	expectShards(t, a, "[0 1]")
+	expectShards(t, b, "[3 4]")
 	expectShards(t, c, "[2]")
 }
 
@@ -337,6 +343,7 @@ func TestJoinErrors(t *testing.T) {
 		{&pb.JoinRequest{Topic: "t", ConsumerId: "a"}, codes.AlreadyExists},
 		{&pb.JoinRequest{Topic: "t"}, codes.InvalidArgument},
 		{&pb.JoinRequest{Topic: "../x", ConsumerId: "b"}, codes.InvalidArgument},
+		{&pb.JoinRequest{Topic: "t", ConsumerId: "b", Group: "../x"}, codes.InvalidArgument},
 	}
 	for _, tt := range tests {
 		stream, err := client.Join(t.Context(), tt.req)
@@ -346,5 +353,180 @@ func TestJoinErrors(t *testing.T) {
 		if status.Code(err) != tt.want {
 			t.Errorf("Join(%v) err = %v, want %v", tt.req, err, tt.want)
 		}
+	}
+}
+
+// A leaving consumer only gives up its own shards: the others keep theirs.
+func TestRebalanceKeepsShards(t *testing.T) {
+	m := func(id string) *member { return &member{id: id, updates: make(chan *pb.Assignment, 1)} }
+	a, b, c := m("a"), m("b"), m("c")
+	s := NewBrokerServer(nil)
+	g := &group{numShards: 5, members: []*member{a, b, c}}
+	s.rebalance("t", g)
+	before := map[*member]string{a: fmt.Sprint((<-a.updates).GetShards()), b: fmt.Sprint((<-b.updates).GetShards())}
+
+	g.members = []*member{a, b}
+	s.rebalance("t", g)
+	for _, m := range g.members {
+		got := (<-m.updates).GetShards()
+		for _, shard := range got[:2] {
+			if !strings.Contains(before[m], fmt.Sprint(shard)) {
+				t.Errorf("%s: kept shards %v, had %s", m.id, got, before[m])
+			}
+		}
+	}
+}
+
+// Each group gets every shard, whatever the other groups do.
+func TestGroupsAreIndependent(t *testing.T) {
+	client := newTestClient(t)
+	a, _ := joinGroup(t, client, "g1", "a")
+	expectShards(t, a, "[0 1 2 3 4]")
+	same, _ := joinGroup(t, client, "g2", "a") // same id, other group: allowed
+	expectShards(t, same, "[0 1 2 3 4]")
+
+	empty, _ := join(t, client, "b")
+	expectShards(t, empty, "[0 1 2 3 4]")
+	named, _ := joinGroup(t, client, "default", "c") // the empty group is "default"
+	expectShards(t, empty, "[0 1 2]")
+	expectShards(t, named, "[3 4]")
+}
+
+func commitOffset(client pb.EventBrokerClient, t *testing.T, group, id string, generation uint64, shard int32, next uint64) error {
+	t.Helper()
+	_, err := client.Commit(t.Context(), &pb.CommitRequest{
+		Topic: "t", Group: group, ConsumerId: id, Generation: generation, Shard: shard, NextId: next,
+	})
+	return err
+}
+
+// firstID returns the first event a group's Subscribe gets on shard 0.
+func firstID(t *testing.T, client pb.EventBrokerClient, group string, req *pb.SubscribeRequest) uint64 {
+	t.Helper()
+	req.Topic, req.Group = "t", group
+	return receive(t, subscribe(t, client, req), 1)[0].GetEventId()
+}
+
+// A shard's next owner resumes where the previous owner committed.
+func TestCommitMovesWithShard(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{}`), req(2, 0, `{}`), req(3, 0, `{}`), req(4, 0, `{}`))
+
+	a, leaveA := joinGroup(t, client, "g", "a")
+	first := expectShards(t, a, "[0 1 2 3 4]")
+	if err := commitOffset(client, t, "g", "a", first.GetGeneration(), 0, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	b, _ := joinGroup(t, client, "g", "b")
+	expectShards(t, b, "[3 4]")
+	leaveA()
+	expectShards(t, b, "[0 1 2 3 4]")
+
+	if id := firstID(t, client, "g", &pb.SubscribeRequest{}); id != 2 {
+		t.Errorf("resumed at %d, want 2", id)
+	}
+	// The request's own position doesn't override a stored offset.
+	if id := firstID(t, client, "g", &pb.SubscribeRequest{StartId: 3}); id != 2 {
+		t.Errorf("resumed at %d with start_id 3, want 2", id)
+	}
+	// Other groups and plain Subscribe calls aren't affected.
+	if id := firstID(t, client, "other", &pb.SubscribeRequest{}); id != 0 {
+		t.Errorf("other group started at %d, want 0", id)
+	}
+	if id := firstID(t, client, "", &pb.SubscribeRequest{StartId: 1}); id != 1 {
+		t.Errorf("plain Subscribe started at %d, want 1", id)
+	}
+}
+
+// With latest, the start position is stored, so a new owner gets what came
+// after it even if nothing was committed.
+func TestLatestPositionIsStored(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"old":true}`))
+
+	// The first event reaches the first reader only after it stored its
+	// position, whatever the timing of the publish: id is that position.
+	first := subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Group: "g", Latest: true})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			stream, err := client.Publish(ctx)
+			if err != nil {
+				return
+			}
+			stream.Send(req(2, 0, `{"new":true}`))
+			stream.CloseSend()
+			stream.Recv()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	id := receive(t, first, 1)[0].GetEventId()
+	if id == 0 {
+		t.Fatal("latest got the old record")
+	}
+	if got := firstID(t, client, "g", &pb.SubscribeRequest{Latest: true}); got != id {
+		t.Errorf("new owner started at %d, want the stored %d", got, id)
+	}
+}
+
+// Only the current owner, in the current generation, can commit.
+func TestCommitFencing(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{}`), req(2, 0, `{}`), req(3, 3, `{}`))
+
+	a, _ := joinGroup(t, client, "g", "a")
+	old := expectShards(t, a, "[0 1 2 3 4]").GetGeneration()
+	b, _ := joinGroup(t, client, "g", "b")
+	current := expectShards(t, a, "[0 1 2]").GetGeneration()
+	expectShards(t, b, "[3 4]")
+
+	tests := []struct {
+		name       string
+		id         string
+		generation uint64
+		shard      int32
+		next       uint64
+		want       codes.Code
+	}{
+		{"owner", "a", current, 0, 1, codes.OK},
+		{"old generation", "a", old, 0, 2, codes.FailedPrecondition},
+		{"shard it lost", "a", current, 3, 1, codes.FailedPrecondition},
+		{"not a member", "z", current, 0, 2, codes.FailedPrecondition},
+		{"past the end", "a", current, 0, 3, codes.OutOfRange},
+		{"bad shard", "a", current, 9, 0, codes.InvalidArgument},
+	}
+	for _, tt := range tests {
+		err := commitOffset(client, t, "g", tt.id, tt.generation, tt.shard, tt.next)
+		if status.Code(err) != tt.want {
+			t.Errorf("%s: err = %v, want %v", tt.name, err, tt.want)
+		}
+	}
+	if id := firstID(t, client, "g", &pb.SubscribeRequest{}); id != 1 {
+		t.Errorf("resumed at %d, want 1 (the refused commits changed nothing)", id)
+	}
+	if err := commitOffset(client, t, "nope", "a", 1, 0, 0); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("unknown group: err = %v, want FailedPrecondition", err)
+	}
+}
+
+// A resent record gets ALREADY_EXISTS and is stored once; a gap is refused.
+func TestPublishDropsRetries(t *testing.T) {
+	client := newTestClient(t)
+	seq := func(id, sequence uint64) *pb.PublishRequest {
+		r := req(id, 0, `{}`)
+		r.ProducerId, r.Sequence = 7, sequence
+		return r
+	}
+	acks := publish(t, client, seq(1, 1), seq(2, 2), seq(3, 2), seq(4, 9), seq(5, 3))
+	want := []codes.Code{codes.OK, codes.OK, codes.AlreadyExists, codes.FailedPrecondition, codes.OK}
+	for i, ack := range acks {
+		if codes.Code(ack.GetErrorCode()) != want[i] {
+			t.Errorf("ack %d = %d, want %v", i, ack.GetErrorCode(), want[i])
+		}
+	}
+	if id := acks[4].GetEventId(); id != 2 {
+		t.Errorf("last record has id %d, want 2 (one duplicate dropped)", id)
 	}
 }

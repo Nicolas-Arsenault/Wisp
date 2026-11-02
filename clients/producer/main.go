@@ -1,6 +1,11 @@
 // Producer reads JSON objects from stdin, one per line, and publishes them
-// over one Publish stream. Each line's shard is hash(key) % shards, computed
-// here, so lines with the same key go to the same shard, in order.
+// with one Publish stream per shard, so a full shard doesn't hold up acks of
+// the others. Each line's shard is hash(key) % shards, computed here, so lines
+// with the same key go to the same shard, in order. Lines without a key take
+// turns over the shards.
+//
+// A failed stream is retried from the first record not yet acked. The broker
+// drops the ones it already has (see producer_id in event.proto).
 //
 // Usage:
 //
@@ -19,11 +24,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"time"
 	"wisp/partition"
 	pb "wisp/proto"
+	"wisp/shards"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -34,10 +43,18 @@ import (
 // defaultAddr is the address the broker listens on (see main.go at the repo root).
 const defaultAddr = "localhost:50051"
 
+const (
+	shardBuffer = 1024 // lines waiting per shard; reading stdin blocks when full
+	maxRetries  = 5    // failed attempts in a row before giving up on a shard
+)
+
+// retryDelay is the wait between attempts. Tests shorten it.
+var retryDelay = 200 * time.Millisecond
+
 func main() {
 	addr := flag.String("addr", defaultAddr, "broker address")
 	topic := flag.String("topic", "", "topic to publish to (required)")
-	keyField := flag.String("key-field", "", "JSON field whose value is the partition key (empty: every line has the same key)")
+	keyField := flag.String("key-field", "", "JSON field whose value is the partition key (empty: lines take turns over the shards)")
 	flag.Parse()
 	if *topic == "" {
 		fmt.Fprintln(os.Stderr, "producer: -topic is required")
@@ -65,8 +82,8 @@ func main() {
 }
 
 // run publishes every non-empty line of in and returns how many were stored.
-// The request id is the line number. Lines rejected as invalid are skipped;
-// any other error stops run.
+// The request id is the line number. Lines that aren't JSON objects are
+// skipped. An error that retries can't fix stops run.
 func run(ctx context.Context, client pb.EventBrokerClient, topic, keyField string, in io.Reader) (int, error) {
 	info, err := client.DescribeTopic(ctx, &pb.DescribeTopicRequest{Topic: topic})
 	if err != nil {
@@ -77,59 +94,75 @@ func run(ctx context.Context, client pb.EventBrokerClient, topic, keyField strin
 		return 0, fmt.Errorf("describe topic %q: broker reported %d shards", topic, numShards)
 	}
 
-	// Cancelling streamCtx unblocks Send if receiving acks fails.
-	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stream, err := client.Publish(streamCtx)
-	if err != nil {
-		return 0, fmt.Errorf("open publish stream: %w", err)
+	// The first error cancels every sender and is what run returns.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	senders := make([]*sender, numShards)
+	var wg sync.WaitGroup
+	for i := range senders {
+		s := &sender{client: client, in: make(chan *pb.PublishRequest, shardBuffer)}
+		senders[i] = s
+		wg.Go(func() {
+			if err := s.run(ctx); err != nil {
+				cancel(err)
+			}
+		})
 	}
 
-	type ackResult struct {
-		stored int
-		err    error
+	if err := sendLines(ctx, senders, topic, keyField, in); err != nil {
+		cancel(err)
 	}
-	acks := make(chan ackResult, 1)
-	go func() {
-		stored, err := receiveAcks(stream)
-		if err != nil {
-			cancel()
-		}
-		acks <- ackResult{stored, err}
-	}()
-
-	sendErr := sendLines(stream, topic, keyField, numShards, in)
-	stream.CloseSend() // always nil
-	res := <-acks
-
-	switch {
-	case ctx.Err() != nil:
-		return res.stored, ctx.Err()
-	case res.err != nil:
-		return res.stored, res.err
-	case sendErr != nil && !errors.Is(sendErr, io.EOF):
-		return res.stored, sendErr
+	for _, s := range senders {
+		close(s.in)
 	}
-	return res.stored, nil
+	wg.Wait()
+
+	stored := 0
+	for _, s := range senders {
+		stored += s.stored
+	}
+	return stored, context.Cause(ctx)
 }
 
-// sendLines sends each non-empty line. io.EOF means the stream ended early
-// (Recv has the reason).
-func sendLines(stream pb.EventBroker_PublishClient, topic, keyField string, numShards int, in io.Reader) error {
+// sendLines gives each valid line to the sender of its shard, numbering each
+// shard's records from 1. The id is new on every run, because the numbering
+// restarts. Invalid lines are skipped here so that they don't use up a sequence.
+func sendLines(ctx context.Context, senders []*sender, topic, keyField string, in io.Reader) error {
+	producerID := rand.Uint64() | 1 // never 0, which means no duplicate check
+	sequences := make([]uint64, len(senders))
+	nextShard := 0 // for lines without a key
+
 	scanner := bufio.NewScanner(in)
 	for line := 1; scanner.Scan(); line++ {
 		payload := []byte(strings.TrimSpace(scanner.Text()))
 		if len(payload) == 0 {
 			continue
 		}
-		req := &pb.PublishRequest{
-			RequestId: uint64(line),
-			Topic:     topic,
-			Shard:     int32(partition.Shard(partitionKey(payload, keyField), numShards)),
-			Payload:   payload,
+		if err := shards.ValidatePayload(payload); err != nil {
+			slog.Warn("invalid event, skipped", "line", line, "err", err)
+			continue
 		}
-		if err := stream.Send(req); err != nil {
-			return err
+
+		shard := nextShard
+		if key := partitionKey(payload, keyField); key != nil {
+			shard = partition.Shard(key, len(senders))
+		} else {
+			nextShard = (nextShard + 1) % len(senders)
+		}
+		sequences[shard]++
+		req := &pb.PublishRequest{
+			RequestId:  uint64(line),
+			Topic:      topic,
+			Shard:      int32(shard),
+			Payload:    payload,
+			ProducerId: producerID,
+			Sequence:   sequences[shard],
+		}
+		select {
+		case senders[shard].in <- req:
+		case <-ctx.Done():
+			return nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -138,32 +171,131 @@ func sendLines(stream pb.EventBroker_PublishClient, topic, keyField string, numS
 	return nil
 }
 
-// receiveAcks counts stored events until the stream ends.
-func receiveAcks(stream pb.EventBroker_PublishClient) (int, error) {
-	stored := 0
-	for {
-		ack, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return stored, nil
+// sender publishes the records of one shard.
+type sender struct {
+	client pb.EventBrokerClient
+	in     chan *pb.PublishRequest // closed when there are no more lines
+	stored int
+
+	mu      sync.Mutex
+	unacked []*pb.PublishRequest // sent or about to be, oldest first
+}
+
+// run opens streams until in is closed and everything is acked.
+func (s *sender) run(ctx context.Context) error {
+	for failures := 1; ; failures++ {
+		before := s.stored
+		err := s.publish(ctx)
+		if err == nil || !retryable(err) || ctx.Err() != nil {
+			return err
 		}
-		if err != nil {
-			return stored, err
+		if s.stored > before {
+			failures = 1
 		}
-		code := codes.Code(ack.GetErrorCode())
-		switch code {
-		case codes.OK:
-			stored++
-			slog.Debug("event stored", "line", ack.GetRequestId(), "shard", ack.GetShard(), "event_id", ack.GetEventId())
-		case codes.InvalidArgument:
-			slog.Warn("broker rejected event, skipped", "line", ack.GetRequestId(), "err", ack.GetErrorMessage())
-		default:
-			return stored, fmt.Errorf("publish line %d: %w", ack.GetRequestId(), status.Error(code, ack.GetErrorMessage()))
+		if failures >= maxRetries {
+			return err
+		}
+		slog.Warn("publish failed, retrying", "attempt", failures, "err", err)
+		select {
+		case <-time.After(retryDelay):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
+// retryable says if sending the records again can help. FailedPrecondition
+// follows an earlier failure: the resend fills the gap.
+func retryable(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.Internal, codes.FailedPrecondition:
+		return true
+	}
+	return false
+}
+
+// publish runs one stream. It returns nil once in is closed and every record
+// is acked.
+func (s *sender) publish(ctx context.Context) error {
+	// Cancelling streamCtx unblocks send if receiving acks fails.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := s.client.Publish(streamCtx)
+	if err != nil {
+		return fmt.Errorf("open publish stream: %w", err)
+	}
+
+	sent := make(chan error, 1)
+	go func() { sent <- s.send(streamCtx, stream) }()
+	ackErr := s.receiveAcks(stream)
+	cancel()
+	sendErr := <-sent
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ackErr != nil {
+		return ackErr
+	}
+	if sendErr != nil || len(s.unacked) > 0 {
+		return status.Error(codes.Unavailable, "publish stream ended early")
+	}
+	return nil
+}
+
+// send resends what isn't acked, then sends new records until in is closed.
+// A record joins unacked before it's sent, so a failed send is retried.
+func (s *sender) send(ctx context.Context, stream pb.EventBroker_PublishClient) error {
+	s.mu.Lock()
+	resend := append([]*pb.PublishRequest{}, s.unacked...)
+	s.mu.Unlock()
+	for _, req := range resend {
+		if err := stream.Send(req); err != nil {
+			return err
+		}
+	}
+	for {
+		select {
+		case req, ok := <-s.in:
+			if !ok {
+				return stream.CloseSend()
+			}
+			s.mu.Lock()
+			s.unacked = append(s.unacked, req)
+			s.mu.Unlock()
+			if err := stream.Send(req); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// receiveAcks removes each stored record from unacked until the stream ends.
+// Acks come in request order, so each one is for the oldest record.
+func (s *sender) receiveAcks(stream pb.EventBroker_PublishClient) error {
+	for {
+		ack, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		code := codes.Code(ack.GetErrorCode())
+		if code != codes.OK && code != codes.AlreadyExists { // AlreadyExists: stored by an earlier attempt
+			return fmt.Errorf("publish line %d: %w", ack.GetRequestId(), status.Error(code, ack.GetErrorMessage()))
+		}
+		slog.Debug("event stored", "line", ack.GetRequestId(), "shard", ack.GetShard(), "event_id", ack.GetEventId())
+		s.stored++
+		s.mu.Lock()
+		s.unacked = s.unacked[1:]
+		s.mu.Unlock()
+	}
+}
+
 // partitionKey returns the value of field keyField (strings without quotes,
-// other values as JSON text), or an empty key if there is none.
+// other values as JSON text), or nil if there is none.
 func partitionKey(payload []byte, keyField string) []byte {
 	if keyField == "" {
 		return nil

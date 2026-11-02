@@ -15,7 +15,10 @@ import (
 // NumShards is the number of shards of a new topic.
 const NumShards = 5
 
-var ErrInvalidTopic = errors.New("stream: invalid topic name")
+var (
+	ErrInvalidTopic = errors.New("stream: invalid topic name")
+	ErrInvalidGroup = errors.New("stream: invalid group name")
+)
 
 // Registry maps topics to their shards. The lock only guards the map
 // (topic creation); the shards need no lock.

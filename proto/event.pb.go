@@ -125,7 +125,12 @@ type PublishRequest struct {
 	// shard is hash(partition key) % num_shards, computed by the producer.
 	Shard int32 `protobuf:"varint,3,opt,name=shard,proto3" json:"shard,omitempty"`
 	// payload must be a JSON object. It is stored as-is.
-	Payload       []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	Payload []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	// producer_id and sequence let the broker drop retried records. sequence
+	// counts a producer's records on one shard: 1, 2, 3, ... A producer_id of 0
+	// turns this off. See PublishAck for the error codes.
+	ProducerId    uint64 `protobuf:"varint,5,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`
+	Sequence      uint64 `protobuf:"varint,6,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -188,6 +193,20 @@ func (x *PublishRequest) GetPayload() []byte {
 	return nil
 }
 
+func (x *PublishRequest) GetProducerId() uint64 {
+	if x != nil {
+		return x.ProducerId
+	}
+	return 0
+}
+
+func (x *PublishRequest) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
 type PublishAck struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	RequestId uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -196,7 +215,9 @@ type PublishAck struct {
 	// Only set when error_code is 0.
 	EventId uint64 `protobuf:"varint,3,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
 	// error_code is a gRPC status code (google.golang.org/grpc/codes);
-	// 0 (OK) means the record is stored on disk.
+	// 0 (OK) means the record is stored on disk. ALREADY_EXISTS means it was
+	// stored by an earlier attempt. FAILED_PRECONDITION means an earlier
+	// sequence is missing: resend from the first record not yet acked.
 	ErrorCode     int32  `protobuf:"varint,4,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
 	ErrorMessage  string `protobuf:"bytes,5,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -272,13 +293,17 @@ type SubscribeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
 	Shard int32                  `protobuf:"varint,2,opt,name=shard,proto3" json:"shard,omitempty"`
-	// start_id is the first event_id to send. Ignored when latest is true.
+	// start_id is the first event_id to send. Ignored when latest is true, or
+	// when group has a stored offset for this shard.
 	StartId uint64 `protobuf:"varint,3,opt,name=start_id,json=startId,proto3" json:"start_id,omitempty"`
 	// latest starts at the end of the shard: only new records are sent.
 	Latest bool `protobuf:"varint,4,opt,name=latest,proto3" json:"latest,omitempty"`
 	// max_bytes caps the payload bytes in one EventBatch (0 = broker default).
 	// A batch always holds at least one record.
-	MaxBytes      uint32 `protobuf:"varint,5,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	MaxBytes uint32 `protobuf:"varint,5,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	// group, if set, starts at the group's stored offset. If it has none, the
+	// start position above becomes its stored offset.
+	Group         string `protobuf:"bytes,6,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -346,6 +371,13 @@ func (x *SubscribeRequest) GetMaxBytes() uint32 {
 		return x.MaxBytes
 	}
 	return 0
+}
+
+func (x *SubscribeRequest) GetGroup() string {
+	if x != nil {
+		return x.Group
+	}
+	return ""
 }
 
 type Event struct {
@@ -472,8 +504,11 @@ func (x *EventBatch) GetEvents() []*Event {
 type JoinRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	// consumer_id must be unique among the topic's consumers.
-	ConsumerId    string `protobuf:"bytes,2,opt,name=consumer_id,json=consumerId,proto3" json:"consumer_id,omitempty"`
+	// consumer_id must be unique in the group.
+	ConsumerId string `protobuf:"bytes,2,opt,name=consumer_id,json=consumerId,proto3" json:"consumer_id,omitempty"`
+	// group is who shares the shards. Empty means "default". Each group reads
+	// the whole topic.
+	Group         string `protobuf:"bytes,3,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -522,10 +557,17 @@ func (x *JoinRequest) GetConsumerId() string {
 	return ""
 }
 
+func (x *JoinRequest) GetGroup() string {
+	if x != nil {
+		return x.Group
+	}
+	return ""
+}
+
 type Assignment struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	// generation increases with each rebalance of the topic.
+	// generation increases with each rebalance of the group.
 	Generation uint64 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
 	// shards this consumer should read now.
 	Shards        []int32 `protobuf:"varint,3,rep,packed,name=shards,proto3" json:"shards,omitempty"`
@@ -584,6 +626,129 @@ func (x *Assignment) GetShards() []int32 {
 	return nil
 }
 
+type CommitRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	// group is the group of the Join. Empty means "default".
+	Group      string `protobuf:"bytes,2,opt,name=group,proto3" json:"group,omitempty"`
+	ConsumerId string `protobuf:"bytes,3,opt,name=consumer_id,json=consumerId,proto3" json:"consumer_id,omitempty"`
+	// generation is that of the consumer's latest Assignment.
+	Generation uint64 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
+	Shard      int32  `protobuf:"varint,5,opt,name=shard,proto3" json:"shard,omitempty"`
+	// next_id is the first event_id not yet processed.
+	NextId        uint64 `protobuf:"varint,6,opt,name=next_id,json=nextId,proto3" json:"next_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommitRequest) Reset() {
+	*x = CommitRequest{}
+	mi := &file_proto_event_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitRequest) ProtoMessage() {}
+
+func (x *CommitRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitRequest.ProtoReflect.Descriptor instead.
+func (*CommitRequest) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *CommitRequest) GetTopic() string {
+	if x != nil {
+		return x.Topic
+	}
+	return ""
+}
+
+func (x *CommitRequest) GetGroup() string {
+	if x != nil {
+		return x.Group
+	}
+	return ""
+}
+
+func (x *CommitRequest) GetConsumerId() string {
+	if x != nil {
+		return x.ConsumerId
+	}
+	return ""
+}
+
+func (x *CommitRequest) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *CommitRequest) GetShard() int32 {
+	if x != nil {
+		return x.Shard
+	}
+	return 0
+}
+
+func (x *CommitRequest) GetNextId() uint64 {
+	if x != nil {
+		return x.NextId
+	}
+	return 0
+}
+
+type CommitResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommitResponse) Reset() {
+	*x = CommitResponse{}
+	mi := &file_proto_event_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommitResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommitResponse) ProtoMessage() {}
+
+func (x *CommitResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_event_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommitResponse.ProtoReflect.Descriptor instead.
+func (*CommitResponse) Descriptor() ([]byte, []int) {
+	return file_proto_event_proto_rawDescGZIP(), []int{10}
+}
+
 var File_proto_event_proto protoreflect.FileDescriptor
 
 const file_proto_event_proto_rawDesc = "" +
@@ -594,13 +759,16 @@ const file_proto_event_proto_rawDesc = "" +
 	"\tTopicInfo\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1d\n" +
 	"\n" +
-	"num_shards\x18\x02 \x01(\x05R\tnumShards\"u\n" +
+	"num_shards\x18\x02 \x01(\x05R\tnumShards\"\xb2\x01\n" +
 	"\x0ePublishRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
 	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x03 \x01(\x05R\x05shard\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\"\xa0\x01\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\x12\x1f\n" +
+	"\vproducer_id\x18\x05 \x01(\x04R\n" +
+	"producerId\x12\x1a\n" +
+	"\bsequence\x18\x06 \x01(\x04R\bsequence\"\xa0\x01\n" +
 	"\n" +
 	"PublishAck\x12\x1d\n" +
 	"\n" +
@@ -609,13 +777,14 @@ const file_proto_event_proto_rawDesc = "" +
 	"\bevent_id\x18\x03 \x01(\x04R\aeventId\x12\x1d\n" +
 	"\n" +
 	"error_code\x18\x04 \x01(\x05R\terrorCode\x12#\n" +
-	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\"\x8e\x01\n" +
+	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\"\xa4\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +
 	"\bstart_id\x18\x03 \x01(\x04R\astartId\x12\x16\n" +
 	"\x06latest\x18\x04 \x01(\bR\x06latest\x12\x1b\n" +
-	"\tmax_bytes\x18\x05 \x01(\rR\bmaxBytes\"Z\n" +
+	"\tmax_bytes\x18\x05 \x01(\rR\bmaxBytes\x12\x14\n" +
+	"\x05group\x18\x06 \x01(\tR\x05group\"Z\n" +
 	"\x05Event\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\x04R\aeventId\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1c\n" +
@@ -624,23 +793,36 @@ const file_proto_event_proto_rawDesc = "" +
 	"EventBatch\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12#\n" +
-	"\x06events\x18\x03 \x03(\v2\v.wisp.EventR\x06events\"D\n" +
+	"\x06events\x18\x03 \x03(\v2\v.wisp.EventR\x06events\"Z\n" +
 	"\vJoinRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1f\n" +
 	"\vconsumer_id\x18\x02 \x01(\tR\n" +
-	"consumerId\"Z\n" +
+	"consumerId\x12\x14\n" +
+	"\x05group\x18\x03 \x01(\tR\x05group\"Z\n" +
 	"\n" +
 	"Assignment\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12\x16\n" +
-	"\x06shards\x18\x03 \x03(\x05R\x06shards2\xea\x01\n" +
+	"\x06shards\x18\x03 \x03(\x05R\x06shards\"\xab\x01\n" +
+	"\rCommitRequest\x12\x14\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05group\x18\x02 \x01(\tR\x05group\x12\x1f\n" +
+	"\vconsumer_id\x18\x03 \x01(\tR\n" +
+	"consumerId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x04 \x01(\x04R\n" +
+	"generation\x12\x14\n" +
+	"\x05shard\x18\x05 \x01(\x05R\x05shard\x12\x17\n" +
+	"\anext_id\x18\x06 \x01(\x04R\x06nextId\"\x10\n" +
+	"\x0eCommitResponse2\x9f\x02\n" +
 	"\vEventBroker\x12<\n" +
 	"\rDescribeTopic\x12\x1a.wisp.DescribeTopicRequest\x1a\x0f.wisp.TopicInfo\x125\n" +
 	"\aPublish\x12\x14.wisp.PublishRequest\x1a\x10.wisp.PublishAck(\x010\x01\x127\n" +
 	"\tSubscribe\x12\x16.wisp.SubscribeRequest\x1a\x10.wisp.EventBatch0\x01\x12-\n" +
-	"\x04Join\x12\x11.wisp.JoinRequest\x1a\x10.wisp.Assignment0\x01B\fZ\n" +
+	"\x04Join\x12\x11.wisp.JoinRequest\x1a\x10.wisp.Assignment0\x01\x123\n" +
+	"\x06Commit\x12\x13.wisp.CommitRequest\x1a\x14.wisp.CommitResponseB\fZ\n" +
 	"wisp/protob\x06proto3"
 
 var (
@@ -655,7 +837,7 @@ func file_proto_event_proto_rawDescGZIP() []byte {
 	return file_proto_event_proto_rawDescData
 }
 
-var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_event_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_proto_event_proto_goTypes = []any{
 	(*DescribeTopicRequest)(nil), // 0: wisp.DescribeTopicRequest
 	(*TopicInfo)(nil),            // 1: wisp.TopicInfo
@@ -666,22 +848,26 @@ var file_proto_event_proto_goTypes = []any{
 	(*EventBatch)(nil),           // 6: wisp.EventBatch
 	(*JoinRequest)(nil),          // 7: wisp.JoinRequest
 	(*Assignment)(nil),           // 8: wisp.Assignment
+	(*CommitRequest)(nil),        // 9: wisp.CommitRequest
+	(*CommitResponse)(nil),       // 10: wisp.CommitResponse
 }
 var file_proto_event_proto_depIdxs = []int32{
-	5, // 0: wisp.EventBatch.events:type_name -> wisp.Event
-	0, // 1: wisp.EventBroker.DescribeTopic:input_type -> wisp.DescribeTopicRequest
-	2, // 2: wisp.EventBroker.Publish:input_type -> wisp.PublishRequest
-	4, // 3: wisp.EventBroker.Subscribe:input_type -> wisp.SubscribeRequest
-	7, // 4: wisp.EventBroker.Join:input_type -> wisp.JoinRequest
-	1, // 5: wisp.EventBroker.DescribeTopic:output_type -> wisp.TopicInfo
-	3, // 6: wisp.EventBroker.Publish:output_type -> wisp.PublishAck
-	6, // 7: wisp.EventBroker.Subscribe:output_type -> wisp.EventBatch
-	8, // 8: wisp.EventBroker.Join:output_type -> wisp.Assignment
-	5, // [5:9] is the sub-list for method output_type
-	1, // [1:5] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	5,  // 0: wisp.EventBatch.events:type_name -> wisp.Event
+	0,  // 1: wisp.EventBroker.DescribeTopic:input_type -> wisp.DescribeTopicRequest
+	2,  // 2: wisp.EventBroker.Publish:input_type -> wisp.PublishRequest
+	4,  // 3: wisp.EventBroker.Subscribe:input_type -> wisp.SubscribeRequest
+	7,  // 4: wisp.EventBroker.Join:input_type -> wisp.JoinRequest
+	9,  // 5: wisp.EventBroker.Commit:input_type -> wisp.CommitRequest
+	1,  // 6: wisp.EventBroker.DescribeTopic:output_type -> wisp.TopicInfo
+	3,  // 7: wisp.EventBroker.Publish:output_type -> wisp.PublishAck
+	6,  // 8: wisp.EventBroker.Subscribe:output_type -> wisp.EventBatch
+	8,  // 9: wisp.EventBroker.Join:output_type -> wisp.Assignment
+	10, // 10: wisp.EventBroker.Commit:output_type -> wisp.CommitResponse
+	6,  // [6:11] is the sub-list for method output_type
+	1,  // [1:6] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_proto_event_proto_init() }
@@ -695,7 +881,7 @@ func file_proto_event_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_event_proto_rawDesc), len(file_proto_event_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

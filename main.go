@@ -37,12 +37,12 @@ type Server struct {
 	pb.UnimplementedEventBrokerServer
 	topics *stream.Registry
 
-	mu     sync.Mutex        // guards groups
-	groups map[string]*group // consumers of each topic (see groups.go)
+	mu     sync.Mutex          // guards groups and offset files
+	groups map[groupKey]*group // consumers of each group (see groups.go)
 }
 
 func NewBrokerServer(topics *stream.Registry) *Server {
-	return &Server{topics: topics, groups: make(map[string]*group)}
+	return &Server{topics: topics, groups: make(map[groupKey]*group)}
 }
 
 // DescribeTopic returns the topic's shard count, creating the topic if needed.
@@ -114,7 +114,7 @@ func (s *Server) enqueue(ctx context.Context, req *pb.PublishRequest) (*shards.P
 	if shard < 0 || int(shard) >= len(topicShards) {
 		return nil, fmt.Errorf("%w: %d (topic has %d)", errBadShard, shard, len(topicShards))
 	}
-	return topicShards[shard].Enqueue(ctx, req.GetPayload())
+	return topicShards[shard].EnqueueFrom(ctx, req.GetPayload(), req.GetProducerId(), req.GetSequence())
 }
 
 // sendAcks sends acks in request order. After a send error it keeps
@@ -143,8 +143,12 @@ func setAckError(ack *pb.PublishAck, err error) {
 
 func codeFor(err error) codes.Code {
 	switch {
-	case errors.Is(err, shards.ErrInvalidPayload), errors.Is(err, stream.ErrInvalidTopic), errors.Is(err, errBadShard):
+	case errors.Is(err, shards.ErrInvalidPayload), errors.Is(err, stream.ErrInvalidTopic), errors.Is(err, stream.ErrInvalidGroup), errors.Is(err, errBadShard):
 		return codes.InvalidArgument
+	case errors.Is(err, shards.ErrDuplicate):
+		return codes.AlreadyExists
+	case errors.Is(err, shards.ErrOutOfOrder):
+		return codes.FailedPrecondition
 	case errors.Is(err, shards.ErrShardFull):
 		return codes.ResourceExhausted
 	case errors.Is(err, shards.ErrShardClosed):
@@ -154,9 +158,10 @@ func codeFor(err error) codes.Code {
 	}
 }
 
-// Subscribe sends one shard from start_id (or from the end if latest): all
-// stored records first, then new ones as they are stored. Records are read
-// from disk, so a slow consumer never loses any.
+// Subscribe sends one shard from the group's stored offset, or else from
+// start_id (or from the end if latest): all stored records first, then new
+// ones as they are stored. Records are read from disk, so a slow consumer
+// never loses any.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_SubscribeServer) error {
 	topicShards, ok := s.topics.Lookup(req.GetTopic())
 	if !ok {
@@ -168,11 +173,9 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 	shard := topicShards[req.GetShard()]
 	maxBytes := fetchSize(req.GetMaxBytes())
 
-	next := req.GetStartId()
-	if req.GetLatest() {
-		next = shard.NextID()
-	} else if next > shard.NextID() {
-		return status.Errorf(codes.OutOfRange, "start_id %d is after the end of the shard (%d)", next, shard.NextID())
+	next, err := s.startID(req, shard)
+	if err != nil {
+		return err
 	}
 
 	slog.Info("consumer subscribed", "topic", req.GetTopic(), "shard", req.GetShard(), "start_id", next)
@@ -202,6 +205,42 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 		}
 		next = records[len(records)-1].ID + 1
 	}
+}
+
+// startID returns where Subscribe starts. The first time a group reads a
+// shard, it stores that position, so with latest a new owner of the shard
+// doesn't skip what came after it.
+func (s *Server) startID(req *pb.SubscribeRequest, shard *shards.Shard) (uint64, error) {
+	if req.GetGroup() == "" {
+		return requestedStart(req, shard)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, ok, err := s.topics.LoadOffset(req.GetTopic(), req.GetGroup(), int(req.GetShard()))
+	if err != nil {
+		return 0, status.Error(codeFor(err), err.Error())
+	}
+	if ok {
+		return stored, nil
+	}
+	next, err := requestedStart(req, shard)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.topics.SaveOffset(req.GetTopic(), req.GetGroup(), int(req.GetShard()), next); err != nil {
+		return 0, status.Error(codeFor(err), err.Error())
+	}
+	return next, nil
+}
+
+func requestedStart(req *pb.SubscribeRequest, shard *shards.Shard) (uint64, error) {
+	if req.GetLatest() {
+		return shard.NextID(), nil
+	}
+	if req.GetStartId() > shard.NextID() {
+		return 0, status.Errorf(codes.OutOfRange, "start_id %d is after the end of the shard (%d)", req.GetStartId(), shard.NextID())
+	}
+	return req.GetStartId(), nil
 }
 
 func fetchSize(requested uint32) int {

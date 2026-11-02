@@ -16,11 +16,12 @@ Each shard has two files in `<dataDir>/<topic>/`:
 A frame in the `.log` (big-endian):
 
 ```
-[4 B body length][8 B event id][8 B timestamp ms][4 B CRC-32C][body = zlib(payload)]
+[4 B body length][8 B event id][8 B timestamp ms][8 B producer id][8 B sequence][4 B CRC-32C][body = zlib(payload)]
 ```
 
 - **Event id:** the record's position in the shard: 0, 1, 2, … It is the consumer's offset.
 - **Timestamp:** when the record was stored (Unix ms).
+- **Producer id, sequence:** used to drop retried records. Producer id 0 means the record has none.
 - **CRC:** detects a torn or damaged frame.
 - **Payload:** stored exactly as the producer sent it. Only checked to be a JSON object; no field is added.
 
@@ -40,6 +41,7 @@ A frame in the `.log` (big-endian):
 - **Bounded queue:** `Enqueue` puts records on a channel of 1024. When it's full, `Enqueue` blocks, which slows the producer down (backpressure).
 - **Batching:** the writer takes everything waiting in the queue (up to 8 MiB), writes it in one write, calls `fsync` once, then updates the index.
 - **Durability:** a record is acked only after its `fsync`. The index isn't fsynced; it can be rebuilt from the `.log`.
+- **Duplicates:** for records with a producer id, the writer keeps each producer's last sequence in memory. `EnqueueFrom` records whose sequence isn't the next one aren't stored: `Wait` returns `ErrDuplicate` if it's lower and `ErrOutOfOrder` if it's higher. A sequence only counts once its record is stored, so a failed write can be retried.
 - **Readers:** `ReadFrom` and `Wait` never block the writer. They only see records up to the committed count, which the writer sets (atomically) after the write.
 
 ## Recovery
@@ -49,9 +51,12 @@ At startup, each shard checks its `.index` against its `.log`. The `.log` is the
 - **Missing index entries:** the `.log` is read from the last index entry to the end, and entries the index doesn't have yet (crash after the fsync) are added.
 - **Torn record:** a torn frame at the end of the `.log` (crash during a write, never acked) is cut off.
 - **Index that doesn't match:** if the index doesn't match the `.log`, it's rebuilt from the start of the `.log`.
+- **Producer sequences:** the whole `.log` is read to find each producer's last sequence, so duplicates are still caught after a restart. A damaged record found here stops the shard from opening, and so the broker from starting.
 
 ## Limits
 
 - Unix only (macOS, Linux), because of mmap.
 - About 4 GiB of `.log` per shard (1 Mi index entries); no segments or growth yet.
+- Startup time grows with the size of the `.log`, because it's read in full.
+- Each producer id stays in memory for as long as the shard exists. Each producer run adds one entry per shard it writes to.
 - Old data from before this format isn't supported. Delete `../data` before upgrading.

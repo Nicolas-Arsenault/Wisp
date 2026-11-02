@@ -13,12 +13,14 @@ import (
 
 // A frame is one record in the .log (big-endian):
 //
-//	[4 B body length][8 B event id][8 B timestamp ms][4 B CRC-32C][body]
+//	[4 B body length][8 B event id][8 B timestamp ms][8 B producer id]
+//	[8 B sequence][4 B CRC-32C][body]
 //
 // body is the zlib-compressed payload. The CRC covers everything but itself.
+// A producer id of 0 means the record has no sequence.
 const (
-	frameHeaderSize = 24
-	frameCRCOffset  = 20
+	frameHeaderSize = 40
+	frameCRCOffset  = 36
 	maxFrameBody    = 64 << 20 // guards against a corrupt length
 )
 
@@ -29,6 +31,15 @@ type Record struct {
 	ID        uint64
 	Timestamp int64 // Unix ms, set when stored
 	Payload   []byte
+}
+
+// frame is one record as stored in the .log.
+type frame struct {
+	id        uint64
+	timestamp int64
+	producer  uint64
+	sequence  uint64
+	body      []byte
 }
 
 // ValidatePayload checks that payload is a JSON object, without decoding it.
@@ -65,17 +76,19 @@ func decompress(body []byte) ([]byte, error) {
 	return payload, nil
 }
 
-// appendFrame appends a frame to dst.
-func appendFrame(dst []byte, id uint64, timestamp int64, body []byte) []byte {
+// appendFrame appends f to dst.
+func appendFrame(dst []byte, f frame) []byte {
 	start := len(dst)
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(body)))
-	dst = binary.BigEndian.AppendUint64(dst, id)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(timestamp))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(f.body)))
+	dst = binary.BigEndian.AppendUint64(dst, f.id)
+	dst = binary.BigEndian.AppendUint64(dst, uint64(f.timestamp))
+	dst = binary.BigEndian.AppendUint64(dst, f.producer)
+	dst = binary.BigEndian.AppendUint64(dst, f.sequence)
 	dst = append(dst, 0, 0, 0, 0) // CRC, set below
-	dst = append(dst, body...)
+	dst = append(dst, f.body...)
 
-	frame := dst[start:]
-	binary.BigEndian.PutUint32(frame[frameCRCOffset:], frameCRC(frame[:frameCRCOffset], body))
+	stored := dst[start:]
+	binary.BigEndian.PutUint32(stored[frameCRCOffset:], frameCRC(stored[:frameCRCOffset], f.body))
 	return dst
 }
 
@@ -90,30 +103,33 @@ func frameSize(bodyLen int) int64 {
 // readFrame reads the next frame from r. It returns io.EOF at the end, and
 // ErrCorruptRecord for an incomplete or damaged frame. Other errors are I/O
 // errors, not bad data.
-func readFrame(r *bufio.Reader) (id uint64, timestamp int64, body []byte, err error) {
+func readFrame(r *bufio.Reader) (frame, error) {
 	var header [frameHeaderSize]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		if err == io.ErrUnexpectedEOF {
 			err = fmt.Errorf("%w: incomplete header", ErrCorruptRecord)
 		}
-		return 0, 0, nil, err
+		return frame{}, err
 	}
 	bodyLen := binary.BigEndian.Uint32(header[0:4])
 	if bodyLen > maxFrameBody {
-		return 0, 0, nil, fmt.Errorf("%w: body too large", ErrCorruptRecord)
+		return frame{}, fmt.Errorf("%w: body too large", ErrCorruptRecord)
 	}
-	id = binary.BigEndian.Uint64(header[4:12])
-	timestamp = int64(binary.BigEndian.Uint64(header[12:20]))
-
-	body = make([]byte, bodyLen)
-	if _, err := io.ReadFull(r, body); err != nil {
+	f := frame{
+		id:        binary.BigEndian.Uint64(header[4:12]),
+		timestamp: int64(binary.BigEndian.Uint64(header[12:20])),
+		producer:  binary.BigEndian.Uint64(header[20:28]),
+		sequence:  binary.BigEndian.Uint64(header[28:36]),
+		body:      make([]byte, bodyLen),
+	}
+	if _, err := io.ReadFull(r, f.body); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			err = fmt.Errorf("%w: incomplete body", ErrCorruptRecord)
 		}
-		return 0, 0, nil, err
+		return frame{}, err
 	}
-	if frameCRC(header[:frameCRCOffset], body) != binary.BigEndian.Uint32(header[frameCRCOffset:]) {
-		return 0, 0, nil, fmt.Errorf("%w: bad CRC for event %d", ErrCorruptRecord, id)
+	if frameCRC(header[:frameCRCOffset], f.body) != binary.BigEndian.Uint32(header[frameCRCOffset:]) {
+		return frame{}, fmt.Errorf("%w: bad CRC for event %d", ErrCorruptRecord, f.id)
 	}
-	return id, timestamp, body, nil
+	return f, nil
 }

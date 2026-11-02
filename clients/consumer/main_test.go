@@ -28,7 +28,10 @@ type fakeBroker struct {
 	assign       chan *pb.Assignment
 	joinErr      error
 	subscribeErr error
+	commitErr    error
+	twoEvents    bool // each Subscribe sends a batch of two events
 	closed       chan int32
+	commits      chan *pb.CommitRequest
 
 	mu         sync.Mutex
 	join       *pb.JoinRequest
@@ -36,7 +39,12 @@ type fakeBroker struct {
 }
 
 func newFakeBroker() *fakeBroker {
-	return &fakeBroker{assign: make(chan *pb.Assignment, 10), closed: make(chan int32, 10)}
+	return &fakeBroker{assign: make(chan *pb.Assignment, 10), closed: make(chan int32, 10), commits: make(chan *pb.CommitRequest, 10)}
+}
+
+func (f *fakeBroker) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
+	f.commits <- req
+	return &pb.CommitResponse{}, f.commitErr
 }
 
 func (f *fakeBroker) Join(req *pb.JoinRequest, stream pb.EventBroker_JoinServer) error {
@@ -69,7 +77,11 @@ func (f *fakeBroker) Subscribe(req *pb.SubscribeRequest, stream pb.EventBroker_S
 		return f.subscribeErr
 	}
 	event := &pb.Event{EventId: 0, Timestamp: testTimestamp, Payload: fmt.Appendf(nil, `{"shard":%d}`, req.GetShard())}
-	if err := stream.Send(&pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard(), Events: []*pb.Event{event}}); err != nil {
+	events := []*pb.Event{event}
+	if f.twoEvents {
+		events = append(events, &pb.Event{EventId: 1, Timestamp: testTimestamp, Payload: []byte(`{}`)})
+	}
+	if err := stream.Send(&pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard(), Events: events}); err != nil {
 		return err
 	}
 	<-stream.Context().Done()
@@ -171,7 +183,7 @@ func TestRunFollowsAssignments(t *testing.T) {
 	broker := newFakeBroker()
 	out := lineWriter{lines: make(chan string, 10)}
 	ctx, cancel := context.WithCancel(t.Context())
-	opts := options{topic: "t", id: "a", offset: 5, maxBytes: 100}
+	opts := options{topic: "t", id: "a", group: "g", offset: 5, maxBytes: 100}
 	done := start(t, ctx, broker, opts, out)
 
 	broker.assign <- &pb.Assignment{Topic: "t", Generation: 1, Shards: []int32{0, 2}}
@@ -187,11 +199,11 @@ func TestRunFollowsAssignments(t *testing.T) {
 	}
 
 	broker.mu.Lock()
-	if broker.join.GetTopic() != "t" || broker.join.GetConsumerId() != "a" {
+	if broker.join.GetTopic() != "t" || broker.join.GetConsumerId() != "a" || broker.join.GetGroup() != "g" {
 		t.Errorf("join request = %v", broker.join)
 	}
 	for _, req := range broker.subscribes {
-		if req.GetStartId() != 5 || req.GetMaxBytes() != 100 || req.GetLatest() {
+		if req.GetStartId() != 5 || req.GetMaxBytes() != 100 || req.GetLatest() || req.GetGroup() != "g" {
 			t.Errorf("subscribe request = %v, want the options", req)
 		}
 	}
@@ -270,5 +282,62 @@ func TestRunReturnsWriteError(t *testing.T) {
 	r := waitFor(t, done, "run to return")
 	if r.err == nil || !strings.Contains(r.err.Error(), "broken pipe") {
 		t.Errorf("err = %v, want the write error", r.err)
+	}
+}
+
+// A batch is committed once, after its last event is printed, with the
+// generation of the latest assignment.
+func TestRunCommitsAfterPrintingBatch(t *testing.T) {
+	broker := newFakeBroker()
+	broker.twoEvents = true
+	out := lineWriter{lines: make(chan string, 10)}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := start(t, ctx, broker, options{topic: "t", id: "a", group: "g"}, out)
+
+	broker.assign <- &pb.Assignment{Generation: 3, Shards: []int32{2}}
+	waitFor(t, out.lines, "first event")
+	waitFor(t, out.lines, "second event")
+
+	c := waitFor(t, broker.commits, "commit")
+	if c.GetTopic() != "t" || c.GetGroup() != "g" || c.GetConsumerId() != "a" ||
+		c.GetGeneration() != 3 || c.GetShard() != 2 || c.GetNextId() != 2 {
+		t.Errorf("commit = %v", c)
+	}
+	if len(broker.commits) != 0 {
+		t.Errorf("%d more commits, want one per batch", len(broker.commits))
+	}
+	cancel()
+	waitFor(t, done, "run to return")
+}
+
+// Nothing printed means nothing committed.
+func TestRunDoesNotCommitUnprintedEvents(t *testing.T) {
+	broker := newFakeBroker()
+	done := start(t, t.Context(), broker, testOpts, failingWriter{})
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{0}}
+
+	waitFor(t, done, "run to return")
+	if len(broker.commits) != 0 {
+		t.Errorf("committed %v, want nothing", <-broker.commits)
+	}
+}
+
+// A refused commit, as after a rebalance, doesn't stop the consumer.
+func TestRunKeepsGoingAfterCommitError(t *testing.T) {
+	broker := newFakeBroker()
+	broker.commitErr = status.Error(codes.FailedPrecondition, "not the owner")
+	out := lineWriter{lines: make(chan string, 10)}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := start(t, ctx, broker, testOpts, out)
+
+	broker.assign <- &pb.Assignment{Generation: 1, Shards: []int32{0}}
+	waitFor(t, out.lines, "event of shard 0")
+	waitFor(t, broker.commits, "commit")
+	broker.assign <- &pb.Assignment{Generation: 2, Shards: []int32{0, 1}}
+	waitFor(t, out.lines, "event of shard 1")
+
+	cancel()
+	if r := waitFor(t, done, "run to return"); r.err != nil || r.printed != 2 {
+		t.Errorf("run = %d, %v, want 2, nil", r.printed, r.err)
 	}
 }

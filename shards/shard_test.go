@@ -2,6 +2,7 @@ package shards
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -371,7 +372,7 @@ func TestRecoverTornLastFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torn := appendFrame(nil, 3, 0, []byte("cut off"))
+	torn := appendFrame(nil, frame{id: 3, timestamp: 0, body: []byte("cut off")})
 	f.Write(torn[:len(torn)-3])
 	f.Close()
 
@@ -451,6 +452,131 @@ func mustCompress(t *testing.T, payload string) []byte {
 	t.Helper()
 	b, err := compress([]byte(payload))
 	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A retry of a stored record is dropped, and a gap is refused, also after a
+// restart.
+func TestSequencesDropRetries(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestShard(t, dir)
+	enqueue := func(s *Shard, producer, sequence uint64) (uint64, error) {
+		t.Helper()
+		p, err := s.EnqueueFrom(t.Context(), []byte(`{}`), producer, sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p.Wait()
+	}
+
+	for sequence := uint64(1); sequence <= 2; sequence++ {
+		if _, err := enqueue(s, 7, sequence); err != nil {
+			t.Fatalf("sequence %d: %v", sequence, err)
+		}
+	}
+	if _, err := enqueue(s, 7, 2); !errors.Is(err, ErrDuplicate) {
+		t.Errorf("retry err = %v, want ErrDuplicate", err)
+	}
+	if _, err := enqueue(s, 7, 4); !errors.Is(err, ErrOutOfOrder) {
+		t.Errorf("gap err = %v, want ErrOutOfOrder", err)
+	}
+	if _, err := enqueue(s, 8, 1); err != nil {
+		t.Errorf("other producer: %v", err)
+	}
+	if s.NextID() != 3 {
+		t.Errorf("stored %d records, want 3", s.NextID())
+	}
+
+	s.Close()
+	s = openTestShard(t, dir)
+	if _, err := enqueue(s, 7, 2); !errors.Is(err, ErrDuplicate) {
+		t.Errorf("retry after restart err = %v, want ErrDuplicate", err)
+	}
+	if _, err := enqueue(s, 7, 3); err != nil {
+		t.Errorf("next sequence after restart: %v", err)
+	}
+}
+
+// Records queued together are checked against each other, not just against
+// what is already on disk.
+func TestSequencesInOneBatch(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	done := func() chan appendResult { return make(chan appendResult, 1) }
+	batch := []appendRequest{
+		{producer: 7, sequence: 1, done: done()},
+		{producer: 7, sequence: 1, done: done()},
+		{producer: 7, sequence: 3, done: done()},
+		{producer: 7, sequence: 2, done: done()},
+	}
+	kept := s.checkSequences(batch)
+	if len(kept) != 2 || kept[0].sequence != 1 || kept[1].sequence != 2 {
+		t.Errorf("kept %+v, want sequences 1 and 2", kept)
+	}
+	if r := <-batch[1].done; !errors.Is(r.err, ErrDuplicate) {
+		t.Errorf("repeat err = %v, want ErrDuplicate", r.err)
+	}
+	if r := <-batch[2].done; !errors.Is(r.err, ErrOutOfOrder) {
+		t.Errorf("gap err = %v, want ErrOutOfOrder", r.err)
+	}
+}
+
+// A sequence is only counted once its record is stored, so a failed write
+// can be retried.
+func TestFailedWriteKeepsSequence(t *testing.T) {
+	s := openTestShard(t, t.TempDir())
+	good := s.log
+	bad, err := os.Open(s.path) // read-only, so writes fail
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Close()
+	s.log = bad
+	r := make(chan appendResult, 1)
+	s.commit([]appendRequest{{body: []byte("x"), producer: 7, sequence: 1, done: r}})
+	s.log = good
+	if res := <-r; res.err == nil {
+		t.Fatal("write to a read-only file succeeded")
+	}
+
+	p, err := s.EnqueueFrom(t.Context(), []byte(`{}`), 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Wait(); err != nil {
+		t.Errorf("retry err = %v, want it stored", err)
+	}
+}
+
+// Without the whole log the broker can't catch duplicates, so a record
+// damaged in the middle of it stops Open.
+func TestOpenRefusesDamagedLog(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestShard(t, dir)
+	for range 3 { // incompressible, so each one passes indexInterval
+		appendOK(t, s, fmt.Sprintf(`{"pad":"%x"}`, randomBytes(t, int(indexInterval))))
+	}
+	s.Close()
+
+	path := filepath.Join(dir, "t", "0"+LogExt)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[frameHeaderSize+1] ^= 0xff // inside the first record
+	if err := os.WriteFile(path, data, filePerm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, "t", 0); !errors.Is(err, ErrCorruptRecord) {
+		t.Errorf("Open err = %v, want ErrCorruptRecord", err)
+	}
+}
+
+func randomBytes(t *testing.T, n int) []byte {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
 		t.Fatal(err)
 	}
 	return b
