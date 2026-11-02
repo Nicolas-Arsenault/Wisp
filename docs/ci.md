@@ -23,7 +23,7 @@ One job on `ubuntu-latest`, with a 15-minute limit. Steps run in order and stop 
 | Vet | `go vet ./...` | `go vet` reports a problem |
 | Tests | `go test -race -count=1 ./...` | any test fails or a data race is detected |
 
-The tests cover every package: the broker (`main_test.go`), `clients/producer`, `clients/consumer`, `shards` and `stream`. They need no network or running broker; gRPC tests use an in-memory `bufconn` connection and write to temp directories.
+The tests cover every package: the broker (`main_test.go`), `clients/producer`, `clients/consumer`, `durable`, `shards` and `stream`. They need no network or running broker; gRPC tests use an in-memory `bufconn` connection and write to temp directories.
 
 ## Versions
 

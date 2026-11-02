@@ -10,6 +10,7 @@ Wisp is a lightweight data streaming platform like AWS kinesis. The goal is for 
 - [Broker](docs/broker.md): gRPC API (`DescribeTopic`, `Publish`, `Subscribe`, `Join`, `Commit`).
 - [Streams](docs/streams.md), [shards](docs/shards.md) and [records](docs/records.md): topics, the on-disk format, offsets and partition keys.
 - [Clients](docs/clients.md): command-line producer and consumer.
+- [Durable agents](docs/durable.md): journal LLM agent runs to Wisp so they resume after a crash and replay for free.
 
 ## Quick start
 
