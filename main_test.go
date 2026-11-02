@@ -91,6 +91,29 @@ func TestDescribeTopic(t *testing.T) {
 	}
 }
 
+func TestDescribeTopicNumShards(t *testing.T) {
+	client := newTestClient(t)
+
+	info, err := client.DescribeTopic(t.Context(), &pb.DescribeTopicRequest{Topic: "run.a", NumShards: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.GetNumShards() != 1 {
+		t.Errorf("num_shards = %d, want 1", info.GetNumShards())
+	}
+	info, err = client.DescribeTopic(t.Context(), &pb.DescribeTopicRequest{Topic: "run.a", NumShards: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.GetNumShards() != 1 {
+		t.Errorf("num_shards = %d, want the existing 1", info.GetNumShards())
+	}
+	_, err = client.DescribeTopic(t.Context(), &pb.DescribeTopicRequest{Topic: "run.b", NumShards: -1})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("num_shards -1: got %v, want InvalidArgument", err)
+	}
+}
+
 func TestPublishAcks(t *testing.T) {
 	client := newTestClient(t)
 	acks := publish(t, client,
@@ -170,6 +193,84 @@ func TestSubscribeReplaysThenStreams(t *testing.T) {
 	if want := `{"n":1} {"n":2} {"n":3}`; strings.Join(got, " ") != want {
 		t.Errorf("payloads = %v, want %s", got, want)
 	}
+}
+
+// readToEnd returns the ids a stop_at_end Subscribe sends before it closes.
+func readToEnd(t *testing.T, sub pb.EventBroker_SubscribeClient) []uint64 {
+	t.Helper()
+	var ids []uint64
+	for {
+		batch, err := sub.Recv()
+		if err == io.EOF {
+			return ids
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		for _, e := range batch.GetEvents() {
+			ids = append(ids, e.GetEventId())
+		}
+	}
+}
+
+func TestSubscribeStopAtEnd(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"n":0}`), req(2, 0, `{"n":1}`), req(3, 0, `{"n":2}`))
+
+	// One record per batch, so the stream has to go round several times.
+	got := readToEnd(t, subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, MaxBytes: 1, StopAtEnd: true}))
+	if fmt.Sprint(got) != "[0 1 2]" {
+		t.Errorf("got ids %v, want [0 1 2]", got)
+	}
+	got = readToEnd(t, subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, StartId: 2, StopAtEnd: true}))
+	if fmt.Sprint(got) != "[2]" {
+		t.Errorf("from 2: got ids %v, want [2]", got)
+	}
+}
+
+func TestSubscribeStopAtEndWithNothingToRead(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"n":0}`))
+
+	if got := readToEnd(t, subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 1, StopAtEnd: true})); len(got) != 0 {
+		t.Errorf("empty shard: got ids %v", got)
+	}
+	if got := readToEnd(t, subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, Latest: true, StopAtEnd: true})); len(got) != 0 {
+		t.Errorf("latest: got ids %v", got)
+	}
+}
+
+// Records stored while the stream runs are after the snapshot, so a reader
+// racing a writer still gets a contiguous prefix and stops.
+func TestSubscribeStopAtEndIgnoresLaterRecords(t *testing.T) {
+	client := newTestClient(t)
+	publish(t, client, req(1, 0, `{"n":0}`), req(2, 0, `{"n":1}`))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for id := uint64(3); id < 40; id++ {
+			stream, err := client.Publish(context.Background())
+			if err != nil {
+				return
+			}
+			stream.Send(req(id, 0, `{"n":2}`))
+			stream.Recv()
+			stream.CloseSend()
+		}
+	}()
+	for range 20 {
+		got := readToEnd(t, subscribe(t, client, &pb.SubscribeRequest{Topic: "t", Shard: 0, StopAtEnd: true}))
+		if len(got) < 2 {
+			t.Fatalf("got ids %v, want every acked record", got)
+		}
+		for i, id := range got {
+			if id != uint64(i) {
+				t.Fatalf("got ids %v, want no gap", got)
+			}
+		}
+	}
+	<-done
 }
 
 func TestSubscribeLatest(t *testing.T) {

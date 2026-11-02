@@ -22,8 +22,12 @@ const (
 )
 
 type DescribeTopicRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Topic         string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Topic string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
+	// num_shards is the shard count if this call creates the topic: 0 means the
+	// default. It's ignored for an existing topic, whose count never changes:
+	// read it from TopicInfo.
+	NumShards     int32 `protobuf:"varint,2,opt,name=num_shards,json=numShards,proto3" json:"num_shards,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -63,6 +67,13 @@ func (x *DescribeTopicRequest) GetTopic() string {
 		return x.Topic
 	}
 	return ""
+}
+
+func (x *DescribeTopicRequest) GetNumShards() int32 {
+	if x != nil {
+		return x.NumShards
+	}
+	return 0
 }
 
 type TopicInfo struct {
@@ -317,7 +328,11 @@ type SubscribeRequest struct {
 	MaxBytes uint32 `protobuf:"varint,5,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
 	// group, if set, starts at the group's stored offset. If it has none, the
 	// start position above becomes its stored offset.
-	Group         string `protobuf:"bytes,6,opt,name=group,proto3" json:"group,omitempty"`
+	Group string `protobuf:"bytes,6,opt,name=group,proto3" json:"group,omitempty"`
+	// stop_at_end closes the stream, without an error, after the last record
+	// stored when the call started, instead of waiting for new ones. Every
+	// record acked before the call is included.
+	StopAtEnd     bool `protobuf:"varint,7,opt,name=stop_at_end,json=stopAtEnd,proto3" json:"stop_at_end,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -392,6 +407,13 @@ func (x *SubscribeRequest) GetGroup() string {
 		return x.Group
 	}
 	return ""
+}
+
+func (x *SubscribeRequest) GetStopAtEnd() bool {
+	if x != nil {
+		return x.StopAtEnd
+	}
+	return false
 }
 
 type Event struct {
@@ -767,9 +789,11 @@ var File_proto_event_proto protoreflect.FileDescriptor
 
 const file_proto_event_proto_rawDesc = "" +
 	"\n" +
-	"\x11proto/event.proto\x12\x04wisp\",\n" +
+	"\x11proto/event.proto\x12\x04wisp\"K\n" +
 	"\x14DescribeTopicRequest\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\"@\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1d\n" +
+	"\n" +
+	"num_shards\x18\x02 \x01(\x05R\tnumShards\"@\n" +
 	"\tTopicInfo\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x1d\n" +
 	"\n" +
@@ -792,14 +816,15 @@ const file_proto_event_proto_rawDesc = "" +
 	"\n" +
 	"error_code\x18\x04 \x01(\x05R\terrorCode\x12#\n" +
 	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\x12\x14\n" +
-	"\x05count\x18\x06 \x01(\rR\x05count\"\xa4\x01\n" +
+	"\x05count\x18\x06 \x01(\rR\x05count\"\xc4\x01\n" +
 	"\x10SubscribeRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05shard\x18\x02 \x01(\x05R\x05shard\x12\x19\n" +
 	"\bstart_id\x18\x03 \x01(\x04R\astartId\x12\x16\n" +
 	"\x06latest\x18\x04 \x01(\bR\x06latest\x12\x1b\n" +
 	"\tmax_bytes\x18\x05 \x01(\rR\bmaxBytes\x12\x14\n" +
-	"\x05group\x18\x06 \x01(\tR\x05group\"Z\n" +
+	"\x05group\x18\x06 \x01(\tR\x05group\x12\x1e\n" +
+	"\vstop_at_end\x18\a \x01(\bR\tstopAtEnd\"Z\n" +
 	"\x05Event\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\x04R\aeventId\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12\x1c\n" +

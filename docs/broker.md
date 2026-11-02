@@ -6,9 +6,12 @@ Def: server that producers publish to and consumers read from.
 
 Listens on `:50051` (`go run .`) and stores data in `../data`, relative to where it's started. At startup it opens every shard already on disk.
 
-### `DescribeTopic(topic)`
+### `DescribeTopic(topic, num_shards)`
 
 Returns the topic's number of shards and creates the topic if needed. Producers call it once so they can hash keys to shards.
+
+- **`num_shards`:** the shard count of a new topic, from 1 to 1024. 0 means the default, 5. An existing topic keeps its count, so read it from the response.
+- **Errors:** `INVALID_ARGUMENT` for a bad topic name or a `num_shards` out of range.
 
 ### `Publish` (bidirectional stream)
 
@@ -30,13 +33,14 @@ A long-lived stream. The command-line producer opens one per shard, so a full sh
 - **Duplicates:** with a `producer_id`, sequences count that producer's records on the shard: 1, 2, 3, …, and `first_sequence` is that of the first payload. A request that's already stored is dropped (`ALREADY_EXISTS`), a partly stored one adds only its new records, and one that leaves a gap is refused (`FAILED_PRECONDITION`), so a retry can't store a record twice or out of order. `producer_id` 0 turns this off. Use a new id whenever the numbering restarts: a reused id with sequences from 1 is dropped as duplicates. Each shard remembers its 1024 most recently active producers (see [shards.md](shards.md)).
 - **Backpressure:** if a shard queue is full, or 256 requests are waiting for their ack, the broker stops reading the stream until there is room.
 
-### `Subscribe(topic, shard, start_id, latest, max_bytes, group)`
+### `Subscribe(topic, shard, start_id, latest, max_bytes, group, stop_at_end)`
 
 Streams **one shard**.
 
 - **History, then live:** first every stored record from `start_id`, then each new record as soon as it's stored, until the consumer leaves.
 - **`latest`:** starts at the end of the shard, so only new records are sent.
 - **`group`:** starts at the group's stored offset, ignoring `start_id` and `latest`. If it has none, the position from `start_id` or `latest` is stored as its offset, so a later owner of the shard doesn't skip what came after it. Without `group`, nothing is stored.
+- **`stop_at_end`:** closes the stream, without an error, after the last record stored when the call started. Every record acked before the call is included, so this reads a complete snapshot of the shard. Records stored later aren't sent.
 - **Batches:** records come in `EventBatch` messages of at most `max_bytes` of payload. The default is 1 MiB and the cap is about 4 MiB (gRPC's default message limit). A batch always holds at least one record.
 - **Slow consumers:** records are read from disk, so a slow consumer only falls behind; it never loses records.
 - **Errors:**
@@ -114,8 +118,9 @@ On Ctrl+C or SIGTERM, the broker:
 
 These run the real broker over an in-memory connection, with its data in a temp dir:
 
+- **DescribeTopic:** shard counts of new and existing topics.
 - **Publish:** acks, error acks, batches, and dropped retries.
-- **Subscribe:** replay then live, `latest`, `max_bytes` batching, and errors.
+- **Subscribe:** replay then live, `latest`, `max_bytes` batching, `stop_at_end`, and errors.
 - **Join:** the A/B/C rebalance flow, every shard having exactly one owner, shards staying put, independent groups, and errors.
 - **Commit:** an offset following its shard to a new owner, a stored `latest` position, and fencing.
 

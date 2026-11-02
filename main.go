@@ -47,7 +47,7 @@ func NewBrokerServer(topics *stream.Registry) *Server {
 
 // DescribeTopic returns the topic's shard count, creating the topic if needed.
 func (s *Server) DescribeTopic(_ context.Context, req *pb.DescribeTopicRequest) (*pb.TopicInfo, error) {
-	topicShards, err := s.topics.Topic(req.GetTopic())
+	topicShards, err := s.topics.TopicWithShards(req.GetTopic(), int(req.GetNumShards()))
 	if err != nil {
 		return nil, status.Error(codeFor(err), err.Error())
 	}
@@ -144,7 +144,7 @@ func setAckError(ack *pb.PublishAck, err error) {
 
 func codeFor(err error) codes.Code {
 	switch {
-	case errors.Is(err, shards.ErrInvalidPayload), errors.Is(err, stream.ErrInvalidTopic), errors.Is(err, stream.ErrInvalidGroup), errors.Is(err, errBadShard):
+	case errors.Is(err, shards.ErrInvalidPayload), errors.Is(err, stream.ErrInvalidTopic), errors.Is(err, stream.ErrInvalidGroup), errors.Is(err, stream.ErrInvalidShards), errors.Is(err, errBadShard):
 		return codes.InvalidArgument
 	case errors.Is(err, shards.ErrDuplicate):
 		return codes.AlreadyExists
@@ -162,7 +162,9 @@ func codeFor(err error) codes.Code {
 // Subscribe sends one shard from the group's stored offset, or else from
 // start_id (or from the end if latest): all stored records first, then new
 // ones as they are stored. Records are read from disk, so a slow consumer
-// never loses any.
+// never loses any. With stop_at_end it returns after the last record stored
+// when it started. The writer sets the end before it acks, so that includes
+// every acked record.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_SubscribeServer) error {
 	topicShards, ok := s.topics.Lookup(req.GetTopic())
 	if !ok {
@@ -179,10 +181,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 		return err
 	}
 	cursor := shards.Cursor{Next: start}
+	end := shard.NextID()
 
 	slog.Info("consumer subscribed", "topic", req.GetTopic(), "shard", req.GetShard(), "start_id", start)
 	ctx := srv.Context()
 	for {
+		if req.GetStopAtEnd() && cursor.Next >= end {
+			return nil
+		}
 		records, next, err := shard.Read(cursor, maxBytes)
 		if err != nil {
 			slog.Error("could not read shard", "topic", req.GetTopic(), "shard", req.GetShard(), "err", err)
@@ -197,6 +203,10 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, srv pb.EventBroker_Subscrib
 				return status.FromContextError(err).Err()
 			}
 			continue
+		}
+
+		if req.GetStopAtEnd() && next.Next > end {
+			records = records[:end-records[0].ID] // stored after the call started
 		}
 
 		batch := &pb.EventBatch{Topic: req.GetTopic(), Shard: req.GetShard(), Events: make([]*pb.Event, len(records))}

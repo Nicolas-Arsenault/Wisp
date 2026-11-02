@@ -40,6 +40,57 @@ func TestTopicCreatesShards(t *testing.T) {
 	}
 }
 
+func TestTopicWithShards(t *testing.T) {
+	r := openTestRegistry(t, t.TempDir())
+
+	one, err := r.TopicWithShards("run.a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(one) != 1 {
+		t.Errorf("got %d shards, want 1", len(one))
+	}
+	// An existing topic keeps its count.
+	again, err := r.TopicWithShards("run.a", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 {
+		t.Errorf("got %d shards, want the existing 1", len(again))
+	}
+	byDefault, err := r.TopicWithShards("orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byDefault) != NumShards {
+		t.Errorf("got %d shards, want the default %d", len(byDefault), NumShards)
+	}
+	for _, n := range []int{-1, MaxShards + 1} {
+		if _, err := r.TopicWithShards("run.b", n); !errors.Is(err, ErrInvalidShards) {
+			t.Errorf("TopicWithShards(%d) = %v, want ErrInvalidShards", n, err)
+		}
+	}
+}
+
+// A one-shard topic is still one shard after a restart.
+func TestReopenKeepsShardCount(t *testing.T) {
+	dir := t.TempDir()
+	r, err := OpenRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.TopicWithShards("run.a", 1); err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+
+	reopened := openTestRegistry(t, dir)
+	found, ok := reopened.Lookup("run.a")
+	if !ok || len(found) != 1 {
+		t.Errorf("found %d shards (ok=%v), want 1", len(found), ok)
+	}
+}
+
 func TestTopicRejectsBadNames(t *testing.T) {
 	r := openTestRegistry(t, t.TempDir())
 	for _, name := range []string{"", ".", "..", "a/b", `a\b`, "../escape"} {

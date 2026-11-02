@@ -12,12 +12,19 @@ import (
 	"wisp/shards"
 )
 
-// NumShards is the number of shards of a new topic.
-const NumShards = 5
+const (
+	// NumShards is the number of shards of a new topic, unless it asks for
+	// another count.
+	NumShards = 5
+	// MaxShards is the most shards a new topic can ask for. Each one costs two
+	// open files and a goroutine for as long as the broker runs.
+	MaxShards = 1024
+)
 
 var (
-	ErrInvalidTopic = errors.New("stream: invalid topic name")
-	ErrInvalidGroup = errors.New("stream: invalid group name")
+	ErrInvalidTopic  = errors.New("stream: invalid topic name")
+	ErrInvalidGroup  = errors.New("stream: invalid group name")
+	ErrInvalidShards = errors.New("stream: invalid shard count")
 )
 
 // Registry maps topics to their shards. The lock only guards the map
@@ -101,6 +108,21 @@ func validTopic(topic string) error {
 // Topic returns the shards of topic, creating it with NumShards shards if
 // needed.
 func (r *Registry) Topic(topic string) ([]*shards.Shard, error) {
+	return r.TopicWithShards(topic, 0)
+}
+
+// TopicWithShards returns the shards of topic, creating it with numShards
+// shards if needed (0 means NumShards). An existing topic keeps its count,
+// whatever numShards is, so callers must use the length of the result.
+// numShards outside 0..MaxShards returns ErrInvalidShards, even for an
+// existing topic.
+func (r *Registry) TopicWithShards(topic string, numShards int) ([]*shards.Shard, error) {
+	if numShards < 0 || numShards > MaxShards {
+		return nil, fmt.Errorf("%w: %d (max %d)", ErrInvalidShards, numShards, MaxShards)
+	}
+	if numShards == 0 {
+		numShards = NumShards
+	}
 	if s, ok := r.Lookup(topic); ok {
 		return s, nil
 	}
@@ -117,7 +139,7 @@ func (r *Registry) Topic(topic string) ([]*shards.Shard, error) {
 		return s, nil
 	}
 	var created []*shards.Shard
-	for id := range NumShards {
+	for id := range numShards {
 		s, err := shards.Open(r.dataDir, topic, id)
 		if err != nil {
 			closeAll(created)
@@ -126,7 +148,7 @@ func (r *Registry) Topic(topic string) ([]*shards.Shard, error) {
 		created = append(created, s)
 	}
 	r.topics[topic] = created
-	log().Info("created topic", "topic", topic, "shards", NumShards)
+	log().Info("created topic", "topic", topic, "shards", numShards)
 	return created, nil
 }
 

@@ -9,7 +9,7 @@ Code: `stream/`.
 `stream.Registry` holds the open shards of every topic.
 
 - **Startup:** `OpenRegistry(dataDir)` opens every shard found on disk (`<dataDir>/<topic>/<id>.log`) and starts one writer per shard. Shard ids of a topic must go from 0 to n-1.
-- **New topics:** `Topic(name)` creates the topic with `NumShards` (5) shards the first time it's used. `Lookup(name)` only finds existing topics.
+- **New topics:** `Topic(name)` creates the topic with `NumShards` (5) shards the first time it's used. `TopicWithShards(name, n)` picks the count, up to `MaxShards` (1024), and is ignored by a topic that already exists. `Lookup(name)` only finds existing topics.
 - **Topic names:** must be a single directory name (no `/`, `\`, `.` or `..`). Otherwise `ErrInvalidTopic`.
 - **Locking:** a mutex only guards the topic map (topic creation). Writing and reading shards takes no lock.
 - **Close:** `Close()` closes every shard; records still queued are stored first.

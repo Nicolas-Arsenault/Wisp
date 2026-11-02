@@ -31,14 +31,16 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type EventBrokerClient interface {
 	// DescribeTopic returns how many shards a topic has, creating the topic if
-	// it doesn't exist yet. Producers call it once to hash keys to shards.
+	// it doesn't exist yet, with num_shards shards if given. Producers call it
+	// once to hash keys to shards.
 	DescribeTopic(ctx context.Context, in *DescribeTopicRequest, opts ...grpc.CallOption) (*TopicInfo, error)
 	// Publish is a long-lived producer stream. Each request holds records of
 	// the shard the producer chose; the broker answers every request with one
 	// ack, in request order.
 	Publish(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PublishRequest, PublishAck], error)
 	// Subscribe streams one shard from start_id (or from its end if latest is
-	// set): first every stored record, then new records as they are written.
+	// set): first every stored record, then new records as they are written,
+	// unless stop_at_end is set.
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EventBatch], error)
 	// Join registers a consumer in a group of a topic for as long as the stream
 	// is open. The broker splits the topic's shards between the group's
@@ -133,14 +135,16 @@ func (c *eventBrokerClient) Commit(ctx context.Context, in *CommitRequest, opts 
 // for forward compatibility.
 type EventBrokerServer interface {
 	// DescribeTopic returns how many shards a topic has, creating the topic if
-	// it doesn't exist yet. Producers call it once to hash keys to shards.
+	// it doesn't exist yet, with num_shards shards if given. Producers call it
+	// once to hash keys to shards.
 	DescribeTopic(context.Context, *DescribeTopicRequest) (*TopicInfo, error)
 	// Publish is a long-lived producer stream. Each request holds records of
 	// the shard the producer chose; the broker answers every request with one
 	// ack, in request order.
 	Publish(grpc.BidiStreamingServer[PublishRequest, PublishAck]) error
 	// Subscribe streams one shard from start_id (or from its end if latest is
-	// set): first every stored record, then new records as they are written.
+	// set): first every stored record, then new records as they are written,
+	// unless stop_at_end is set.
 	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[EventBatch]) error
 	// Join registers a consumer in a group of a topic for as long as the stream
 	// is open. The broker splits the topic's shards between the group's

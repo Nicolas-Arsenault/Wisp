@@ -5,14 +5,16 @@ option go_package = "wisp/proto";
 
 service EventBroker {
   // DescribeTopic returns how many shards a topic has, creating the topic if
-  // it doesn't exist yet. Producers call it once to hash keys to shards.
+  // it doesn't exist yet, with num_shards shards if given. Producers call it
+  // once to hash keys to shards.
   rpc DescribeTopic (DescribeTopicRequest) returns (TopicInfo);
   // Publish is a long-lived producer stream. Each request holds records of
   // the shard the producer chose; the broker answers every request with one
   // ack, in request order.
   rpc Publish (stream PublishRequest) returns (stream PublishAck);
   // Subscribe streams one shard from start_id (or from its end if latest is
-  // set): first every stored record, then new records as they are written.
+  // set): first every stored record, then new records as they are written,
+  // unless stop_at_end is set.
   rpc Subscribe (SubscribeRequest) returns (stream EventBatch);
   // Join registers a consumer in a group of a topic for as long as the stream
   // is open. The broker splits the topic's shards between the group's
@@ -25,6 +27,10 @@ service EventBroker {
 
 message DescribeTopicRequest {
   string topic = 1;
+  // num_shards is the shard count if this call creates the topic: 0 means the
+  // default. It's ignored for an existing topic, whose count never changes:
+  // read it from TopicInfo.
+  int32 num_shards = 2;
 }
 
 message TopicInfo {
@@ -82,6 +88,10 @@ message SubscribeRequest {
   // group, if set, starts at the group's stored offset. If it has none, the
   // start position above becomes its stored offset.
   string group = 6;
+  // stop_at_end closes the stream, without an error, after the last record
+  // stored when the call started, instead of waiting for new ones. Every
+  // record acked before the call is included.
+  bool stop_at_end = 7;
 }
 
 message Event {
